@@ -68,7 +68,7 @@ def main():
     text = "\n".join(report)
     print(text)
     if os.getenv("GITHUB_STEP_SUMMARY"):
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
             f.write(text + "\n")
     sys.exit(1 if failures else 0)
 

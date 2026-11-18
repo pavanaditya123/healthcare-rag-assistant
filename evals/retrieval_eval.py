@@ -10,6 +10,9 @@ Datasets
   2. TREC 2017 LiveQA-Med: real consumer questions, with NIST/NLM judgments
      of MedQuAD answers. Judgment 3 (Incomplete) or 4 (Excellent) = relevant.
      After excluding ADAM/Drugs/Herbs: 39 questions, 106 relevant pairs.
+     10 of those pairs (e.g. NIHSeniorHealth_0000062_Sec6) are not in the
+     public MedQuAD XML - the qrels were judged on an earlier build - so
+     38 questions / 96 pairs are scorable. Both counts are reported.
      SMALL - treat differences of a few points as noise.
 
 Stages: sparse (BM25), dense (bge-small), fused (RRF), reranked (cross-encoder).
@@ -59,6 +62,8 @@ def liveqa_questions(questions_xml, qrels_txt, corpus_ids):
         if judgment[0] in "34" and answer_id.split("_")[0] not in EXCLUDED_SOURCES:
             gold.setdefault(qid, set()).add(answer_id)
 
+    stats = {"judged_questions": len(gold), "judged_pairs": sum(len(g) for g in gold.values()),
+             "pairs_missing_from_public_medquad": sorted(a for g in gold.values() for a in g - corpus_ids)}
     out = []
     for q in ET.parse(questions_xml).getroot().iter("NLM-QUESTION"):
         qid = q.get("qid").removeprefix("TQ")
@@ -70,7 +75,7 @@ def liveqa_questions(questions_xml, qrels_txt, corpus_ids):
             continue
         out.append({"qid": qid, "question": text, "gold": gold[qid] & corpus_ids,
                     "paraphrase": (q.findtext("NIST-PARAPHRASE") or "").strip()})
-    return out
+    return out, stats
 
 
 # ------------------------------------------------------------------ metrics
@@ -191,7 +196,7 @@ def main():
 
     corpus_ids = {c.id for c in chunks}
     mq = medquad_questions(chunks, args.sample)
-    lq = liveqa_questions(
+    lq, lq_stats = liveqa_questions(
         data / "LiveQA/TestDataset/TREC-2017-LiveQA-Medical-Test-Questions-w-summaries.xml",
         data / "qrels/QA-TestSet-LiveQA-Med-Qrels-2479-Answers/All-qrels_LiveQAMed2017-TestQuestions_2479_Judged-Answers.txt",
         corpus_ids,
@@ -203,6 +208,7 @@ def main():
         "liveqa_paraphrased": evaluate(retriever, lq, field="paraphrase"),
     }
     results["liveqa"]["relevant_pairs"] = sum(len(q["gold"]) for q in lq)
+    results["liveqa"].update(lq_stats)
     results["speed_tradeoff"] = speed_tradeoff(retriever, s, mq[: args.speed_sample])
 
     oos = [r["question"] for r in load_safety_set() if r["label"] == OUT_OF_SCOPE]
@@ -220,6 +226,8 @@ def main():
         table("MedQuAD held-out questions", results["medquad"]),
         table(f"TREC LiveQA-Med real consumer questions — SMALL: {lq_r['n']} questions, {lq_r['relevant_pairs']} relevant pairs",
               lq_r),
+        f"Judged: {lq_r['judged_questions']} questions / {lq_r['judged_pairs']} relevant pairs; "
+        f"{len(lq_r['pairs_missing_from_public_medquad'])} pairs are not in the public MedQuAD XML, so not scorable.\n",
         table("LiveQA, NIST paraphrased versions of the same questions", results["liveqa_paraphrased"]),
         f"#### Speed vs accuracy (MedQuAD, first {args.speed_sample} questions)", "",
         "| candidates/retriever | rerank chars | recall@5 | MRR | rerank p50 ms | total p95 ms |", "|---|---|---|---|---|---|",
@@ -242,10 +250,10 @@ def main():
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     for r in ("medquad", "liveqa", "liveqa_paraphrased"):
         results[r].pop("top_rerank_scores")
-    Path(args.out).write_text(json.dumps(results, indent=2))
-    Path(args.out).with_suffix(".md").write_text(text + "\n")
+    Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
+    Path(args.out).with_suffix(".md").write_text(text + "\n", encoding="utf-8")
     if os.getenv("GITHUB_STEP_SUMMARY"):
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
             f.write(text + "\n")
 
     got = results["medquad"]["stages"]["reranked"]["recall@5"]

@@ -71,7 +71,7 @@ async def run(args):
     if summary["error_rate"] > args.max_error_rate:
         failures.append(f"error rate {summary['error_rate']:.2%} > {args.max_error_rate:.2%}")
     if os.getenv("GITHUB_STEP_SUMMARY"):
-        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
             f.write(f"### Load test: {args.name}\n\n```\n" + json.dumps(summary, indent=2) + "\n```\n"
                     + ("**FAIL:** " + "; ".join(failures) if failures else "**PASS**") + "\n")
     if failures:
