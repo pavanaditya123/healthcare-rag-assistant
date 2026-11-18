@@ -1,0 +1,106 @@
+"""The question -> answer pipeline.
+
+    redact PHI -> route -> retrieve -> threshold -> LLM -> validate citations
+                    |                      |          |           |
+                 emergency /           "no reliable  LLM down /  invalid ->
+                 refusal (no LLM)       info"        sources-only answer
+"""
+import re
+from dataclasses import asdict, dataclass, field
+
+from app import safety
+from app.config import Settings
+from app.llm import LLMError
+from app.metrics import DEGRADED
+from app.retrieval import Hit
+
+SYSTEM_PROMPT = (
+    "You are a health information assistant. Answer ONLY from the numbered NIH sources "
+    "provided. End every paragraph with the numbers of the sources it uses, like [1] or [2][3]. "
+    "If the sources do not answer the question, say so. Never diagnose, never recommend "
+    "doses, and suggest seeing a healthcare professional for personal medical decisions. "
+    "Use plain language and at most 150 words."
+)
+MAX_SOURCE_CHARS = 1500  # keep the prompt small; MedQuAD answers can be very long
+CITATION = re.compile(r"\[(\d+)\]")
+DISCLAIMER = re.compile(r"doctor|healthcare (?:professional|provider)|pharmacist|clinician", re.IGNORECASE)
+
+
+@dataclass
+class Answer:
+    route: str                 # emergency / diagnosis_dose / out_of_scope / no_info / answered / degraded
+    answer: str
+    sources: list[dict] = field(default_factory=list)
+    model: str | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def build_messages(question: str, hits: list[Hit]) -> list[dict]:
+    blocks = [
+        f"[{i}] {h.payload['focus']} ({h.payload['url']})\n{h.payload['text'][:MAX_SOURCE_CHARS]}"
+        for i, h in enumerate(hits, start=1)
+    ]
+    user = f"Question: {question}\n\nSources:\n" + "\n\n".join(blocks)
+    return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
+
+
+def citations_valid(text: str, n_sources: int) -> bool:
+    """Rules:
+      * every cited number must be a source we actually provided (no invented [7])
+      * every paragraph must cite something, except a short "see your doctor" note
+      * at least one citation overall
+    """
+    cited_all = [int(n) for n in CITATION.findall(text)]
+    if not cited_all or any(n < 1 or n > n_sources for n in cited_all):
+        return False
+    for p in re.split(r"\n\s*\n", text.strip()):
+        if not CITATION.search(p) and not DISCLAIMER.search(p):
+            return False
+    return True
+
+
+def format_sources(hits: list[Hit]) -> list[dict]:
+    return [
+        {"n": i, "id": h.id, "title": h.payload["focus"], "url": h.payload["url"],
+         "score": round(h.score, 3), "snippet": h.payload["text"][:300]}
+        for i, h in enumerate(hits, start=1)
+    ]
+
+
+def sources_only(hits: list[Hit]) -> str:
+    """Degraded mode: no generated text, just the top NIH passages, cited."""
+    lines = ["The AI summary is unavailable right now. Most relevant NIH passages:"]
+    lines += [f"- {h.payload['text'][:300].replace(chr(10), ': ', 1)}... [{i}]" for i, h in enumerate(hits[:3], 1)]
+    return "\n".join(lines)
+
+
+class Assistant:
+    def __init__(self, retriever, llm, settings: Settings):
+        self.retriever, self.llm, self.s = retriever, llm, settings
+
+    def answer(self, question: str) -> Answer:
+        """`question` must already be PHI-redacted (see main.py)."""
+        route = safety.classify(question)
+        if route == safety.EMERGENCY:
+            return Answer(route, safety.EMERGENCY_MESSAGE)
+        if route == safety.DIAGNOSIS_DOSE:
+            return Answer(route, safety.DIAGNOSIS_DOSE_MESSAGE)
+        if route == safety.OUT_OF_SCOPE:
+            return Answer(route, safety.OUT_OF_SCOPE_MESSAGE)
+
+        hits = self.retriever.search(question).reranked[: self.s.top_k]
+        if not hits or hits[0].score < self.s.min_rerank_score:
+            return Answer("no_info", safety.NO_INFO_MESSAGE)
+        sources = format_sources(hits)
+
+        try:
+            text, model = self.llm.complete(build_messages(question, hits))
+        except LLMError:
+            DEGRADED.labels("llm_unavailable").inc()
+            return Answer("degraded", sources_only(hits), sources)
+        if not citations_valid(text, len(hits)):
+            DEGRADED.labels("invalid_citations").inc()
+            return Answer("degraded", sources_only(hits), sources, model)
+        return Answer("answered", text, sources, model)
