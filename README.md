@@ -100,6 +100,16 @@ from CPU contention in the reranker. That finding led to per-process inference l
 shedding (see *Reliability and scale*). CI now gates a normal-load phase (1 user per core) on
 p95 and an overload phase on shedding fast instead of slowing down.
 
+| Load phase (CI, 2 vCPU, 2 workers) | req/s | p50 | p95 | errors | shed (503) |
+|---|---|---|---|---|---|
+| Before limits: 20 concurrent users | 1.6 | 16.9 s | **20.9 s** | 0% | — |
+| Normal: 2 concurrent users (gate p95 ≤ 3 s) | 3.1 | 706 ms | **1,116 ms** | 0% | 0% |
+| Overload: 20 concurrent users | 23.3 | 31 ms | 2,473 ms (served) | 0% | 24% |
+
+Under overload the pod no longer slows everyone down: requests it can serve stay
+bounded, the rest get an immediate 503 to retry elsewhere, and in Kubernetes the HPA
+adds pods. Going from 20 to 10 rerank candidates took normal-load p95 from 3.3 s to 1.1 s.
+
 ## Data
 
 | | |
