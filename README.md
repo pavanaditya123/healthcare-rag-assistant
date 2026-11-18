@@ -69,8 +69,21 @@ What the stage-by-stage numbers say:
 | 20 | 500 chars | 0.926 | 782 ms | 2,174 ms |
 | **10 (default)** | **1,000 chars (default)** | **0.926** | **746 ms** | **2,063 ms** |
 
-Reranking 10 candidates instead of 20 costs nothing measurable in recall and cuts rerank time
-by 32%, so it is the default. (Headline tables above were run at 20; the CI run uses the default.)
+On MedQuAD, reranking 10 candidates instead of 20 costs nothing measurable and cuts rerank
+time by 32%. The full CI eval at the 10-candidate default shows the trade-off is **not free on
+real questions**:
+
+| Reranked recall@5 | 20 candidates (local) | 10 candidates (CI, default) |
+|---|---|---|
+| MedQuAD (n = 1,000) | 0.925 | 0.921 |
+| LiveQA-Med (n = 38) | 0.523 | 0.449 |
+| LiveQA paraphrased (n = 38) | 0.439 | 0.514 |
+
+Messy consumer questions put the right passage deeper in the fused list, so a smaller pool
+loses it. With 38 questions the gap is noisy (the paraphrased set moved the other way), but
+it is the honest cost of the latency win. 10 is the default because it keeps normal-load p95
+near 1 s on CPU. With a GPU, or a pod with more cores, set `CANDIDATES=20`.
+(Headline tables above were run at 20.)
 Latencies are from a Windows laptop running the eval alone; BM25 + dense together take ~25 ms on
 the CI runner, the reranker is ~98% of search time.
 
@@ -192,7 +205,7 @@ with 422, and filters are part of the cache key.
 | Redis answer cache | Repeated questions skip retrieval and the LLM entirely (ms instead of seconds) |
 | BM25 and dense search run in parallel | They are independent; total = max(sparse, dense) instead of the sum |
 | Reranker reads at most `RERANK_MAX_CHARS` (1,000) per passage | Cross-encoder cost grows with tokens; the eval's speed table shows the recall cost of each setting |
-| Candidates per retriever (`CANDIDATES`, 20) | Fewer candidates = fewer cross-encoder pairs; same speed table |
+| Candidates per retriever (`CANDIDATES`, 10) | Fewer candidates = fewer cross-encoder pairs; same speed table |
 | Streaming (`/ask/stream`) | Sources arrive right after retrieval and text starts at the LLM's first token, instead of waiting for the whole answer. Time-to-first-token is a metric (`stage="llm_first_token"`) |
 | `LLM_MAX_TOKENS=300` | Answers are capped at ~150 words anyway; generation time scales with output tokens |
 | Warm-up query at startup | The first ONNX run is slow; pods pay it before readiness, not on a user request |
