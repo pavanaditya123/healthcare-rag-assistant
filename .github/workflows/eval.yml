@@ -27,7 +27,7 @@ jobs:
       - name: Retrieval + safety end-to-end (+ real Groq answers if the secret is set)
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: python -m evals.retrieval_eval --sample 1000 --min-medquad-recall 0.0
+        run: python -m evals.retrieval_eval --sample 1000 --min-medquad-recall 0.90
       - uses: actions/upload-artifact@v4
         with:
           name: eval-results
