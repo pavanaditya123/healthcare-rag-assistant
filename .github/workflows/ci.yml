@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  FASTEMBED_CACHE_PATH: /home/runner/.cache/fastembed
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip}
+      - run: pip install -r requirements-dev.txt
+      - name: Unit tests (fake models, no network)
+        run: pytest -q
+      - name: Safety gate (router confusion matrix)
+        run: python -m evals.safety_eval
+
+  load-test:
+    needs: test
+    runs-on: ubuntu-latest
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.12.5
+        ports: ["6333:6333"]
+      redis:
+        image: redis:7.4-alpine
+        ports: ["6379:6379"]
+    env:
+      QDRANT_URL: http://localhost:6333
+      REDIS_URL: redis://localhost:6379/0
+      LLM_PROVIDER: stub
+      STUB_LATENCY_S: "0.3"          # pretend the LLM takes 300 ms
+      RATE_LIMIT_PER_MIN: "1000000"  # all load comes from one IP
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip}
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.FASTEMBED_CACHE_PATH }}
+          key: fastembed-${{ hashFiles('app/config.py') }}
+      - run: bash scripts/download_data.sh
+      - name: Build index (3,000 chunks is enough to load-test the service)
+        run: python -m app.ingest --medquad data/MedQuAD --limit 3000
+      - name: Start API (2 workers)
+        run: |
+          nohup uvicorn app.main:app --port 8000 --workers 2 > api.log 2>&1 &
+          for i in $(seq 60); do curl -sf localhost:8000/readyz && exit 0; sleep 2; done
+          cat api.log; exit 1
+      - name: Load test
+        run: python scripts/load_test.py --requests 400 --concurrency 20 --max-p95-ms 5000
+      - name: Per-stage latency from /metrics
+        if: always()
+        run: curl -s localhost:8000/metrics | grep -E '^rag_(stage_latency_seconds_(sum|count)|requests_total|cache_total)' || true
+      - if: failure()
+        run: tail -100 api.log
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions: {contents: read, packages: write}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ghcr.io/pavanaditya123/healthcare-rag-assistant:latest,ghcr.io/pavanaditya123/healthcare-rag-assistant:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
