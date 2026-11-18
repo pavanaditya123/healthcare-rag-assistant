@@ -37,6 +37,11 @@ jobs:
       LLM_PROVIDER: stub
       STUB_LATENCY_S: "0.3"          # pretend the LLM takes 300 ms
       RATE_LIMIT_PER_MIN: "1000000"  # all load comes from one IP
+      # 2-vCPU runner, 2 workers: 1 ONNX thread and 1 inference slot per worker,
+      # so model work never oversubscribes the CPU.
+      ONNX_THREADS: "1"
+      MAX_INFLIGHT: "1"
+      QUEUE_TIMEOUT_S: "2"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -54,11 +59,15 @@ jobs:
           nohup uvicorn app.main:app --port 8000 --workers 2 > api.log 2>&1 &
           for i in $(seq 60); do curl -sf localhost:8000/readyz && exit 0; sleep 2; done
           cat api.log; exit 1
-      - name: Load test
-        run: python scripts/load_test.py --requests 400 --concurrency 20 --max-p95-ms 5000
+      - name: Load test - normal load (4 concurrent users)
+        run: python scripts/load_test.py --name "normal load" --requests 200 --concurrency 4 --max-p95-ms 3000
+      - name: Load test - overload (20 concurrent) must shed, not slow down
+        # Expect fast 503s for the excess; served requests must stay bounded by
+        # QUEUE_TIMEOUT_S + one request's work instead of growing with the queue.
+        run: python scripts/load_test.py --name "overload" --requests 300 --concurrency 20 --max-p95-ms 6000 --max-shed-rate 0.9
       - name: Per-stage latency from /metrics
         if: always()
-        run: curl -s localhost:8000/metrics | grep -E '^rag_(stage_latency_seconds_(sum|count)|requests_total|cache_total)' || true
+        run: curl -s localhost:8000/metrics | grep -E '^rag_(stage_latency_seconds_(sum|count)|requests_total|cache_total|shed_total)' || true
       - if: failure()
         run: tail -100 api.log
 

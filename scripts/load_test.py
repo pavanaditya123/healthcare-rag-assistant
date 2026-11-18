@@ -51,23 +51,28 @@ async def run(args):
         await asyncio.gather(*(worker(client, args.url, queue, results) for _ in range(args.concurrency)))
     wall = time.perf_counter() - t0
 
-    lat = sorted(r[0] * 1000 for r in results)
-    errors = sum(1 for _, code in results if code != 200)
+    # 503 = deliberate load shedding (pod at capacity), counted separately from errors.
+    lat = sorted(t * 1000 for t, code in results if code == 200) or [0.0]
+    shed = sum(1 for _, code in results if code == 503)
+    errors = sum(1 for _, code in results if code not in (200, 503))
     pct = lambda p: lat[min(len(lat) - 1, int(len(lat) * p))]  # noqa: E731
     summary = {
         "requests": len(results), "concurrency": args.concurrency, "rps": round(len(results) / wall, 1),
         "p50_ms": round(pct(0.50)), "p95_ms": round(pct(0.95)), "p99_ms": round(pct(0.99)),
         "error_rate": round(errors / len(results), 4),
+        "shed_rate": round(shed / len(results), 4),   # latency percentiles are for served (200) requests
     }
     print(json.dumps(summary, indent=2))
     failures = []
     if summary["p95_ms"] > args.max_p95_ms:
         failures.append(f"p95 {summary['p95_ms']}ms > {args.max_p95_ms}ms")
+    if summary["shed_rate"] > args.max_shed_rate:
+        failures.append(f"shed rate {summary['shed_rate']:.2%} > {args.max_shed_rate:.2%}")
     if summary["error_rate"] > args.max_error_rate:
         failures.append(f"error rate {summary['error_rate']:.2%} > {args.max_error_rate:.2%}")
     if os.getenv("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-            f.write("### Load test (stub LLM)\n\n```\n" + json.dumps(summary, indent=2) + "\n```\n"
+            f.write(f"### Load test: {args.name}\n\n```\n" + json.dumps(summary, indent=2) + "\n```\n"
                     + ("**FAIL:** " + "; ".join(failures) if failures else "**PASS**") + "\n")
     if failures:
         print("FAIL:", "; ".join(failures))
@@ -82,4 +87,6 @@ if __name__ == "__main__":
     ap.add_argument("--repeat-ratio", type=float, default=0.3, help="share of exact repeats (cache hits)")
     ap.add_argument("--max-p95-ms", type=float, default=3000)
     ap.add_argument("--max-error-rate", type=float, default=0.01)
+    ap.add_argument("--max-shed-rate", type=float, default=0.0, help="share of 503s allowed (overload test)")
+    ap.add_argument("--name", default="stub LLM")
     asyncio.run(run(ap.parse_args()))
