@@ -1,0 +1,24 @@
+# One-off index build: clone MedQuAD at a pinned commit, then ingest into Qdrant.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rag-ingest
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: fetch-data
+          image: alpine/git:2.47.1
+          command: ["sh", "-c", "git clone https://github.com/abachaa/MedQuAD.git /data/MedQuAD && git -C /data/MedQuAD checkout 577bd37b96c02d1833b2c9eed2de9f96964e96cb"]
+          volumeMounts: [{name: data, mountPath: /data}]
+      containers:
+        - name: ingest
+          image: ghcr.io/pavanaditya123/healthcare-rag-assistant:latest
+          command: ["python", "-m", "app.ingest", "--medquad", "/data/MedQuAD"]
+          envFrom: [{configMapRef: {name: rag-config}}]
+          volumeMounts: [{name: data, mountPath: /data}]
+      volumes:
+        - name: data
+          emptyDir: {}
