@@ -77,3 +77,10 @@ class FakeLLM:
         if self.error:
             raise self.error
         return self.text, "fake-model"
+
+    def stream(self, messages):
+        self.calls += 1
+        if self.error:
+            raise self.error
+        for word in self.text.split(" "):
+            yield word + " ", "fake-model"

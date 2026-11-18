@@ -1,3 +1,5 @@
+import json
+
 from fastapi.testclient import TestClient
 
 from app.answer import Assistant
@@ -60,3 +62,31 @@ def test_filters_reach_retriever_and_are_validated():
     ok = c.post("/ask", json={"question": "What is glaucoma?", "sources": ["GHR"], "qtypes": ["treatment"]})
     assert ok.status_code == 200 and retriever.filters == (["GHR"], ["treatment"])
     assert c.post("/ask", json={"question": "What is glaucoma?", "sources": ["WebMD"]}).status_code == 422
+
+
+def stream_events(c, question):
+    r = c.post("/ask/stream", json={"question": question})
+    return [json.loads(line[6:]) for line in r.text.splitlines() if line.startswith("data: ")]
+
+
+def test_stream_sends_sources_then_tokens_then_done():
+    c, _ = make()
+    events = stream_events(c, "What is glaucoma?")
+    types = [e["type"] for e in events]
+    assert types[0] == "sources" and types[-1] == "done" and "token" in types
+    assert events[-1]["route"] == "answered" and "[1]" in events[-1]["answer"]
+    # second call is served from the cache as a single "done" event
+    again = stream_events(c, "What is glaucoma?")
+    assert [e["type"] for e in again] == ["done"] and again[0]["cached"] is True
+
+
+def test_stream_replaces_uncited_answer_with_sources_only():
+    c, _ = make(llm=FakeLLM(text="Glaucoma is bad."))
+    done = stream_events(c, "What is glaucoma?")[-1]
+    assert done["route"] == "degraded" and "optic nerve" in done["answer"]
+
+
+def test_stream_emergency_has_no_tokens():
+    c, _ = make()
+    events = stream_events(c, "I want to end my life")
+    assert [e["type"] for e in events] == ["done"] and "988" in events[0]["answer"]

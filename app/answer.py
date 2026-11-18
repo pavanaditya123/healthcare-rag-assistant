@@ -80,20 +80,56 @@ class Assistant:
     def __init__(self, retriever, llm, settings: Settings):
         self.retriever, self.llm, self.s = retriever, llm, settings
 
+    def _route_and_retrieve(self, question, sources, qtypes):
+        """Shared by answer() and stream(): returns (final Answer, None) when we
+        must not call the LLM, else (None, top hits)."""
+        route = safety.classify(question)
+        if route == safety.EMERGENCY:
+            return Answer(route, safety.EMERGENCY_MESSAGE), None
+        if route == safety.DIAGNOSIS_DOSE:
+            return Answer(route, safety.DIAGNOSIS_DOSE_MESSAGE), None
+        if route == safety.OUT_OF_SCOPE:
+            return Answer(route, safety.OUT_OF_SCOPE_MESSAGE), None
+        hits = self.retriever.search(question, sources=sources, qtypes=qtypes).reranked[: self.s.top_k]
+        if not hits or hits[0].score < self.s.min_rerank_score:
+            return Answer("no_info", safety.NO_INFO_MESSAGE), None
+        return None, hits
+
+    def stream(self, question: str, sources=None, qtypes=None):
+        """Yield events for /ask/stream:
+          {"type": "sources", ...}  as soon as retrieval is done (~fast)
+          {"type": "token", ...}    LLM text as it is generated
+          {"type": "done", ...}     the final, validated Answer. If citations fail
+                                    validation, "done" carries the sources-only answer
+                                    and the client must replace what it displayed.
+        """
+        early, hits = self._route_and_retrieve(question, sources, qtypes)
+        if early:
+            yield {"type": "done", **early.to_dict()}
+            return
+        srcs = format_sources(hits)
+        yield {"type": "sources", "sources": srcs}
+        text, model = "", None
+        try:
+            for delta, model in self.llm.stream(build_messages(question, hits)):
+                text += delta
+                yield {"type": "token", "text": delta}
+        except LLMError:
+            DEGRADED.labels("llm_unavailable").inc()
+            yield {"type": "done", **Answer("degraded", sources_only(hits), srcs, model).to_dict()}
+            return
+        if not citations_valid(text, len(hits)):
+            DEGRADED.labels("invalid_citations").inc()
+            yield {"type": "done", **Answer("degraded", sources_only(hits), srcs, model).to_dict()}
+            return
+        yield {"type": "done", **Answer("answered", text.strip(), srcs, model).to_dict()}
+
     def answer(self, question: str, sources: list[str] | None = None, qtypes: list[str] | None = None) -> Answer:
         """`question` must already be PHI-redacted (see main.py).
         `sources` / `qtypes` are optional metadata filters (see retrieval.search)."""
-        route = safety.classify(question)
-        if route == safety.EMERGENCY:
-            return Answer(route, safety.EMERGENCY_MESSAGE)
-        if route == safety.DIAGNOSIS_DOSE:
-            return Answer(route, safety.DIAGNOSIS_DOSE_MESSAGE)
-        if route == safety.OUT_OF_SCOPE:
-            return Answer(route, safety.OUT_OF_SCOPE_MESSAGE)
-
-        hits = self.retriever.search(question, sources=sources, qtypes=qtypes).reranked[: self.s.top_k]
-        if not hits or hits[0].score < self.s.min_rerank_score:
-            return Answer("no_info", safety.NO_INFO_MESSAGE)
+        early, hits = self._route_and_retrieve(question, sources, qtypes)
+        if early:
+            return early
         sources = format_sources(hits)
 
         try:
