@@ -59,8 +59,10 @@ jobs:
           nohup uvicorn app.main:app --port 8000 --workers 2 > api.log 2>&1 &
           for i in $(seq 60); do curl -sf localhost:8000/readyz && exit 0; sleep 2; done
           cat api.log; exit 1
-      - name: Load test - normal load (4 concurrent users)
-        run: python scripts/load_test.py --name "normal load" --requests 200 --concurrency 4 --max-p95-ms 3000
+      - name: Load test - normal load (2 concurrent users = 1 per core)
+        # Capacity of this 2-vCPU box is ~1 search in flight per core; more than
+        # that is the overload phase below. p95 must stay under 3 s with no shedding.
+        run: python scripts/load_test.py --name "normal load" --requests 150 --concurrency 2 --max-p95-ms 3000 --max-shed-rate 0.01
       - name: Load test - overload (20 concurrent) must shed, not slow down
         # Expect fast 503s for the excess; served requests must stay bounded by
         # QUEUE_TIMEOUT_S + one request's work instead of growing with the queue.
