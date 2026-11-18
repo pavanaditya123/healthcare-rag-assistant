@@ -13,7 +13,7 @@ env:
 jobs:
   eval:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150  # ~1.7 s per rerank on a 2-vCPU runner x ~2,300 searches
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
