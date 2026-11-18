@@ -48,3 +48,20 @@ def test_non_retryable_error_skips_straight_to_fallback():
 def test_raises_when_everything_fails():
     with pytest.raises(LLMError):
         client(lambda req: httpx.Response(500)).complete([])
+
+
+def test_stream_parses_sse_and_falls_back_before_first_token():
+    sse = (
+        'data: {"choices":[{"delta":{"content":"Hello "}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"[1]"}}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+
+    def handler(req):
+        body = req.read().decode()
+        if '"big"' in body:
+            return httpx.Response(503)
+        return httpx.Response(200, text=sse, headers={"content-type": "text/event-stream"})
+
+    out = list(client(handler).stream([]))
+    assert "".join(t for t, _ in out) == "Hello [1]" and out[0][1] == "small"

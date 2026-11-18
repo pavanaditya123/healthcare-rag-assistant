@@ -6,6 +6,7 @@ Resilience, in order:
   3. fall back to a smaller, faster model
   4. if both fail, raise LLMError -> caller serves a sources-only answer
 """
+import json
 import os
 import time
 
@@ -56,6 +57,41 @@ class GroqLLM:
                     time.sleep(self.backoff_s * 2 ** attempt)
         raise LLMError("primary and fallback models failed")
 
+    def stream(self, messages: list[dict]):
+        """Yield (text_delta, model) as tokens arrive (server-sent events from Groq).
+
+        Falls back to the second model only if the first fails BEFORE sending
+        any token; retrying mid-answer would repeat text the user already saw.
+        """
+        for model in (self.s.primary_model, self.s.fallback_model):
+            started = False
+            t0 = time.perf_counter()
+            try:
+                with self.http.stream(
+                    "POST", self.s.groq_url,
+                    headers={"Authorization": f"Bearer {self.s.groq_api_key}"},
+                    json={"model": model, "messages": messages, "temperature": 0,
+                          "max_tokens": self.s.llm_max_tokens, "stream": True},
+                    timeout=self.s.llm_timeout_s,
+                ) as resp:
+                    resp.raise_for_status()
+                    for line in resp.iter_lines():
+                        if not line.startswith("data: ") or line == "data: [DONE]":
+                            continue
+                        delta = json.loads(line[6:])["choices"][0]["delta"].get("content")
+                        if delta:
+                            if not started:
+                                STAGE_LATENCY.labels("llm_first_token").observe(time.perf_counter() - t0)
+                                started = True
+                            yield delta, model
+                LLM_CALLS.labels(model, "ok").inc()
+                return
+            except (httpx.HTTPError, KeyError, ValueError) as e:
+                LLM_CALLS.labels(model, "error").inc()
+                if started:
+                    raise LLMError("stream broke mid-answer") from e
+        raise LLMError("primary and fallback models failed")
+
 
 class StubLLM:
     """Deterministic stand-in for tests and load tests (no network, no key)."""
@@ -65,7 +101,14 @@ class StubLLM:
 
     def complete(self, messages: list[dict]) -> tuple[str, str]:
         time.sleep(self.latency_s)  # simulate LLM latency in load tests
-        return "Stubbed answer based on the retrieved NIH passage. [1]", "stub"
+        return self.TEXT, "stub"
+
+    TEXT = "Stubbed answer based on the retrieved NIH passage. [1]"
+
+    def stream(self, messages: list[dict]):
+        time.sleep(self.latency_s / 3)  # first token arrives before the full answer
+        for word in self.TEXT.split(" "):
+            yield word + " ", "stub"
 
 
 def make_llm(s: Settings):
