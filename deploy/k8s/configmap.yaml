@@ -9,5 +9,10 @@ data:
   LLM_TIMEOUT_S: "10"
   RATE_LIMIT_PER_MIN: "30"
   MIN_RERANK_SCORE: "0.0"
+  # Pod CPU limit is 1 core: one inference at a time, one ONNX thread.
+  # Extra requests wait up to 5 s, then get a fast 503 while the HPA adds pods.
+  ONNX_THREADS: "1"
+  MAX_INFLIGHT: "1"
+  QUEUE_TIMEOUT_S: "5"
 # The Groq key is a Secret, never in git:
 #   kubectl create secret generic groq --from-literal=GROQ_API_KEY=...
