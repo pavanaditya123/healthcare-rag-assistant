@@ -25,7 +25,80 @@ question ─► PHI redaction ─► safety router ──► emergency  → help
 
 ## Results
 
-RESULTS_PLACEHOLDER
+Full corpus (16,407 chunks, 5,476 NIH pages), real models, CPU only. Reproduce with
+`python -m evals.retrieval_eval`; CI re-runs it on every change to `app/` or `evals/`
+and fails if MedQuAD reranked recall@5 drops below 0.90.
+
+**MedQuAD held-out questions (n = 1,000)**
+
+| Stage | recall@5 | MRR |
+|---|---|---|
+| BM25 (sparse) | 0.754 | 0.497 |
+| bge-small (dense) | 0.880 | 0.731 |
+| RRF fusion | 0.864 | 0.627 |
+| **RRF + cross-encoder rerank** | **0.925** | **0.791** |
+
+Reranker ceiling (fused recall@20) is 0.959, so the reranker recovers most of what fusion finds.
+
+**TREC 2017 LiveQA-Med, real consumer questions — SMALL (38 questions, 96 relevant pairs)**
+
+| Stage | recall@5 | hit@5 | MRR |
+|---|---|---|---|
+| BM25 | 0.239 | 0.395 | 0.281 |
+| dense | 0.414 | 0.605 | 0.436 |
+| RRF fusion | 0.393 | 0.553 | 0.398 |
+| **+ rerank** | **0.523** | **0.763** | **0.503** |
+
+The qrels judge 39 questions / 106 pairs after the copyright exclusions, but 10 of those
+pairs (e.g. `NIHSeniorHealth_0000062_Sec6`) are not in the public MedQuAD XML (the qrels
+were made on an earlier build), so 38 / 96 are scorable. Real questions are long and messy
+("I have a 3 year old son with…"), which is why every stage drops sharply versus MedQuAD.
+
+What the stage-by-stage numbers say:
+- **Dense beats BM25 by a wide margin**, on both datasets. Consumer wording rarely matches NIH wording.
+- **RRF alone does not beat dense here.** BM25 is weak enough that fusing it in costs a little at the top. Fusion still widens the candidate pool, which is what the reranker needs.
+- **The cross-encoder is the biggest single gain** (+6 points recall@5 on MedQuAD, +13 on LiveQA).
+- On the 38 NIST *paraphrased* LiveQA questions the reranker scored lower than fusion (0.439 vs 0.520 recall@5). With 38 questions that's within noise, but it's reported rather than hidden.
+
+**Speed vs accuracy (same index, MedQuAD, 300 questions)**
+
+| Candidates per retriever | Reranker reads | recall@5 | rerank p50 | search p95 |
+|---|---|---|---|---|
+| 20 | full passage | 0.924 | 1,883 ms | 3,463 ms |
+| 20 | 1,000 chars | 0.929 | 1,103 ms | 2,464 ms |
+| 20 | 500 chars | 0.926 | 782 ms | 2,174 ms |
+| **10 (default)** | **1,000 chars (default)** | **0.926** | **746 ms** | **2,063 ms** |
+
+Reranking 10 candidates instead of 20 costs nothing measurable in recall and cuts rerank time
+by 32%, so it is the default. (Headline tables above were run at 20; the CI run uses the default.)
+Latencies are from a Windows laptop running the eval alone; BM25 + dense together take ~25 ms on
+the CI runner, the reranker is ~98% of search time.
+
+**"No reliable info" threshold (best cross-encoder score)**
+
+| Threshold | In-domain questions refused | Out-of-scope questions answered |
+|---|---|---|
+| −6 | 0.0% | 17.4% |
+| −4 | 0.0% | 0.0% |
+| **0 (default)** | **0.2%** | **0.0%** |
+| 4 | 5.1% | 0.0% |
+
+**Safety set, end to end (100 questions)**
+
+| True label | Outcome |
+|---|---|
+| emergency (25) | 25 → helplines, LLM never called |
+| diagnosis / dose (24) | 24 → refused, LLM never called |
+| out of scope (23) | 20 → refused by rule, 3 → "no reliable info" via the score threshold, **0 answered** |
+| normal (28) | 27 answered, 1 "no reliable info" |
+
+Router-only confusion matrix (gated in CI): emergency recall 100%, no emergency or dosing
+question ever reaches the LLM, accuracy 97%.
+
+**Load (CI, 2-vCPU runner, stubbed LLM).** The first run at 20 concurrent users gave p95 = 20.9 s
+from CPU contention in the reranker. That finding led to per-process inference limits and load
+shedding (see *Reliability and scale*). CI now gates a normal-load phase (1 user per core) on
+p95 and an overload phase on shedding fast instead of slowing down.
 
 ## Data
 
@@ -52,7 +125,7 @@ keeps the MedQuAD eval honest: the index has never seen any eval question.
 | Eval | What it measures | Where |
 |---|---|---|
 | MedQuAD held-out questions | 1,000 sampled questions → the QA pair they came from. recall@5, MRR per stage | `evals/retrieval_eval.py`, eval workflow |
-| TREC 2017 LiveQA-Med | Real consumer questions with NIST/NLM judgments of MedQuAD answers; judgment 3 or 4 = relevant. **Small: 39 questions, 106 relevant pairs** after the copyright exclusions | same |
+| TREC 2017 LiveQA-Med | Real consumer questions with NIST/NLM judgments of MedQuAD answers; judgment 3 or 4 = relevant. **Small: 39 questions / 106 relevant pairs** after the copyright exclusions, 38 / 96 scorable against the public XML | same |
 | Safety set | 100 hand-written questions (emergency / diagnosis-dose / out-of-scope / normal) → router confusion matrix, **gated in CI** | `evals/safety_eval.py`, CI workflow |
 | Real LLM answers | Citation-validation pass rate and latency with Groq (only when `GROQ_API_KEY` is set) | `evals/answer_eval.py` |
 | Load test | p50/p95/p99 and error rate with a stubbed LLM, **gated in CI** | `scripts/load_test.py`, CI workflow |
