@@ -11,5 +11,5 @@ fetch() {  # repo dir commit
 fetch MedQuAD MedQuAD 577bd37b96c02d1833b2c9eed2de9f96964e96cb
 fetch LiveQA_MedicalTask_TREC2017 LiveQA 725a2d914e9794afbb897ac2006e3b0c6a7834c4
 # LiveQA relevance judgments against MedQuAD answers ship as a zip inside MedQuAD.
-unzip -o -q MedQuAD/QA-TestSet-LiveQA-Med-Qrels-2479-Answers.zip -d qrels -x "__MACOSX/*"
+unzip -o -q MedQuAD/QA-TestSet-LiveQA-Med-Qrels-2479-Answers.zip -d qrels && rm -rf qrels/__MACOSX
 echo "data ready: $(pwd)"
