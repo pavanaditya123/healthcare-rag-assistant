@@ -1,0 +1,7 @@
+.venv
+data
+qdrant_storage
+.git
+tests
+evals
+**/__pycache__
