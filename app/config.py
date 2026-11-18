@@ -19,6 +19,14 @@ class Settings:
     sparse_model: str = _env("SPARSE_MODEL", "Qdrant/bm25")
     rerank_model: str = _env("RERANK_MODEL", "Xenova/ms-marco-MiniLM-L-6-v2")
 
+    # CPU protection. Model inference is CPU-bound: running more requests at once
+    # than we have cores makes EVERY request slow. So each process lets at most
+    # MAX_INFLIGHT searches run; others wait up to QUEUE_TIMEOUT_S, then get a
+    # fast 503 (load shedding) and the HPA adds pods.
+    max_inflight: int = int(_env("MAX_INFLIGHT", "2"))
+    queue_timeout_s: float = float(_env("QUEUE_TIMEOUT_S", "5"))
+    onnx_threads: int = int(_env("ONNX_THREADS", "0"))  # 0 = let ONNX decide
+
     # Retrieval knobs
     candidates_per_retriever: int = int(_env("CANDIDATES", "20"))
     top_k: int = int(_env("TOP_K", "5"))

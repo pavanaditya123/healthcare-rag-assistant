@@ -1,6 +1,6 @@
 """Prometheus metrics. Every pipeline stage is timed separately so a latency
 regression can be traced to sparse search, dense search, rerank or the LLM."""
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 STAGE_LATENCY = Histogram(
     "rag_stage_latency_seconds", "Latency of each pipeline stage", ["stage"],
@@ -15,3 +15,5 @@ CACHE = Counter("rag_cache_total", "Answer cache lookups", ["result"])          
 LLM_CALLS = Counter("rag_llm_calls_total", "LLM calls", ["model", "outcome"])  # ok / error
 DEGRADED = Counter("rag_degraded_total", "Sources-only answers", ["reason"])
 RATE_LIMITED = Counter("rag_rate_limited_total", "Requests rejected by rate limiter")
+SHED = Counter("rag_shed_total", "Requests rejected because the pod was at capacity")
+INFLIGHT = Gauge("rag_inflight_searches", "Searches currently using the CPU")

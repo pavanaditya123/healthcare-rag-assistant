@@ -4,6 +4,7 @@ Reciprocal Rank Fusion, then re-scored by a cross-encoder.
 Each stage's output is returned separately so the evals can measure what
 every stage contributes.
 """
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -12,9 +13,13 @@ from dataclasses import dataclass, field
 from qdrant_client import QdrantClient, models
 
 from app.config import Settings
-from app.metrics import STAGE_LATENCY
+from app.metrics import INFLIGHT, SHED, STAGE_LATENCY
 
 DENSE, SPARSE = "dense", "bm25"
+
+
+class Overloaded(Exception):
+    """All inference slots busy for longer than QUEUE_TIMEOUT_S."""
 
 
 @dataclass
@@ -40,9 +45,10 @@ class Encoders:
         from fastembed import SparseTextEmbedding, TextEmbedding
         from fastembed.rerank.cross_encoder import TextCrossEncoder
 
-        self.dense = TextEmbedding(s.dense_model)
-        self.sparse = SparseTextEmbedding(s.sparse_model)
-        self.reranker = TextCrossEncoder(s.rerank_model)
+        threads = s.onnx_threads or None
+        self.dense = TextEmbedding(s.dense_model, threads=threads)
+        self.sparse = SparseTextEmbedding(s.sparse_model, threads=threads)
+        self.reranker = TextCrossEncoder(s.rerank_model, threads=threads)
         self.dense_dim = len(next(iter(self.dense.embed(["dim probe"]))))
 
 
@@ -70,6 +76,7 @@ class HybridRetriever:
     def __init__(self, client: QdrantClient, encoders, settings: Settings):
         self.client, self.enc, self.s = client, encoders, settings
         self.pool = ThreadPoolExecutor(max_workers=8)
+        self.slots = threading.BoundedSemaphore(settings.max_inflight)
 
     # ---------- indexing ----------
     def create_collection(self):
@@ -140,6 +147,17 @@ class HybridRetriever:
           sources: e.g. ["GHR", "GARD"] - only genetic / rare-disease pages
           qtypes:  e.g. ["treatment"]   - only "How is X treated?" sections
         """
+        if not self.slots.acquire(timeout=self.s.queue_timeout_s):
+            SHED.inc()
+            raise Overloaded()
+        INFLIGHT.inc()
+        try:
+            return self._search(query, sources, qtypes)
+        finally:
+            INFLIGHT.dec()
+            self.slots.release()
+
+    def _search(self, query, sources, qtypes) -> SearchResult:
         k, r = self.s.candidates_per_retriever, SearchResult()
         flt = make_filter(sources, qtypes)
 

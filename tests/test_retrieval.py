@@ -2,7 +2,9 @@ from qdrant_client import QdrantClient
 
 from app.config import Settings
 from app.data import Chunk
-from app.retrieval import Hit, HybridRetriever, rrf
+import pytest
+
+from app.retrieval import Hit, HybridRetriever, Overloaded, rrf
 from tests.fakes import FakeEncoders
 
 
@@ -51,3 +53,15 @@ def test_metadata_filters_restrict_both_retrievers():
     assert {h.payload["source"] for h in only_ghr.sparse + only_ghr.dense} == {"GHR"}
     assert [h.id for h in treatment.reranked] == ["NIDDK_0000001_Sec1"]
     assert set(only_ghr.timings_ms) == {"sparse", "dense", "fusion", "rerank"}
+
+
+def test_search_sheds_load_when_all_slots_are_busy():
+    s = Settings(collection="test", max_inflight=1, queue_timeout_s=0.01)
+    r = HybridRetriever(QdrantClient(":memory:"), FakeEncoders(), s)
+    r.create_collection()
+    r.index([chunk(1, "glaucoma", "Glaucoma damages the optic nerve.")])
+    r.slots.acquire()  # another request is using the only slot
+    with pytest.raises(Overloaded):
+        r.search("glaucoma")
+    r.slots.release()
+    assert r.search("glaucoma").reranked  # works again once the slot is free
