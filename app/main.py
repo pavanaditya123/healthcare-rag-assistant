@@ -4,6 +4,7 @@ load balancer and the HPA can add or remove pods freely.
 
     uvicorn app.main:app --port 8000
 """
+import itertools
 import json
 import logging
 import time
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field, field_validator
 from app.answer import Assistant
 from app.cache import AnswerCache, RateLimiter, make_store
 from app.config import Settings, settings
+from app.retrieval import Overloaded
 from app.metrics import RATE_LIMITED, REQUEST_LATENCY, REQUESTS
 from app.safety import redact
 
@@ -66,6 +68,10 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
     app.state.cache = AnswerCache(app.state.store, s.cache_ttl_s)
     app.state.limiter = RateLimiter(app.state.store, s.rate_limit_per_min)
 
+    def busy() -> HTTPException:
+        # Fail fast instead of queueing forever; clients/load balancer retry another pod.
+        return HTTPException(503, "Server busy, please retry.", headers={"Retry-After": "1"})
+
     def prepare(body: AskRequest, request: Request) -> tuple[str, str]:
         """Rate limit, then redact. Returns (redacted question, cache key)."""
         client = request.client.host if request.client else "unknown"
@@ -91,7 +97,10 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
         start = time.perf_counter()
         question, cache_q = prepare(body, request)
         cached = app.state.cache.get(cache_q)
-        result = cached or app.state.assistant.answer(question, sources=body.sources, qtypes=body.qtypes).to_dict()
+        try:
+            result = cached or app.state.assistant.answer(question, sources=body.sources, qtypes=body.qtypes).to_dict()
+        except Overloaded:
+            raise busy()
         finish(result, cache_q, question, start, cached=bool(cached))
         return {**result, "cached": bool(cached)}
 
@@ -102,13 +111,22 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
         start = time.perf_counter()
         question, cache_q = prepare(body, request)
         cached = app.state.cache.get(cache_q)
+        stream = first = None
+        if not cached:
+            # Pull the first event (routing + retrieval) now, so an overloaded pod
+            # can still answer 503 before the streaming response has started.
+            stream = app.state.assistant.stream(question, sources=body.sources, qtypes=body.qtypes)
+            try:
+                first = next(stream)
+            except Overloaded:
+                raise busy()
 
         def events():
             if cached:
                 final = {"type": "done", **cached}
                 yield f"data: {json.dumps({**final, 'cached': True})}\n\n"
             else:
-                for event in app.state.assistant.stream(question, sources=body.sources, qtypes=body.qtypes):
+                for event in itertools.chain([first], stream):
                     if event["type"] == "done":
                         final = event
                     yield f"data: {json.dumps(event)}\n\n"

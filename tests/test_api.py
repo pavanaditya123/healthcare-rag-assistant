@@ -90,3 +90,10 @@ def test_stream_emergency_has_no_tokens():
     c, _ = make()
     events = stream_events(c, "I want to end my life")
     assert [e["type"] for e in events] == ["done"] and "988" in events[0]["answer"]
+
+
+def test_overloaded_pod_returns_fast_503_with_retry_after():
+    c, _ = make(retriever=FakeRetriever(overloaded=True))
+    for path in ("/ask", "/ask/stream"):
+        r = c.post(path, json={"question": "What is glaucoma?"})
+        assert r.status_code == 503 and r.headers["retry-after"] == "1"

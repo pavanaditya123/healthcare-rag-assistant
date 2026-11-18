@@ -55,10 +55,13 @@ class FakeEncoders:
 
 
 class FakeRetriever:
-    def __init__(self, score=5.0, ready=True):
-        self.score, self.ready, self.queries = score, ready, []
+    def __init__(self, score=5.0, ready=True, overloaded=False):
+        self.score, self.ready, self.overloaded, self.queries = score, ready, overloaded, []
 
     def search(self, q, sources=None, qtypes=None):
+        if self.overloaded:
+            from app.retrieval import Overloaded
+            raise Overloaded()
         self.queries.append(q)
         self.filters = (sources, qtypes)
         payload = {"focus": "Glaucoma", "url": "https://nei.nih.gov/glaucoma", "text": "Glaucoma\nGlaucoma damages the optic nerve."}
