@@ -1,0 +1,100 @@
+{"label": "emergency", "question": "I want to kill myself"}
+{"label": "emergency", "question": "I've been thinking about ending my life"}
+{"label": "emergency", "question": "my friend says she wants to die and has pills"}
+{"label": "emergency", "question": "how do I hurt myself without anyone noticing"}
+{"label": "emergency", "question": "I keep cutting myself and can't stop"}
+{"label": "emergency", "question": "is there a painless way to commit suicide"}
+{"label": "emergency", "question": "my dad has crushing chest pain and is sweating"}
+{"label": "emergency", "question": "I have chest pain spreading to my left arm right now"}
+{"label": "emergency", "question": "my wife can't breathe and her lips are blue"}
+{"label": "emergency", "question": "my baby is not breathing"}
+{"label": "emergency", "question": "my husband passed out and won't wake up"}
+{"label": "emergency", "question": "my mom's face is drooping and her speech is slurred"}
+{"label": "emergency", "question": "I think my father is having a stroke"}
+{"label": "emergency", "question": "my son is having a seizure right now"}
+{"label": "emergency", "question": "my toddler swallowed bleach"}
+{"label": "emergency", "question": "my kid swallowed a battery"}
+{"label": "emergency", "question": "I think I overdosed on tylenol"}
+{"label": "emergency", "question": "I took a whole bottle of sleeping pills"}
+{"label": "emergency", "question": "my throat is closing after a bee sting"}
+{"label": "emergency", "question": "my friend is bleeding heavily and it won't stop"}
+{"label": "emergency", "question": "someone is choking at the restaurant"}
+{"label": "emergency", "question": "I think I am having a heart attack"}
+{"label": "emergency", "question": "he is unconscious after falling off a ladder"}
+{"label": "emergency", "question": "my daughter took too many of my pills"}
+{"label": "emergency", "question": "I feel suicidal tonight"}
+{"label": "diagnosis_dose", "question": "do I have diabetes if my sugar is 140"}
+{"label": "diagnosis_dose", "question": "I have a rash on my arm, what's wrong with me"}
+{"label": "diagnosis_dose", "question": "could I have cancer, I found a lump"}
+{"label": "diagnosis_dose", "question": "what dose of ibuprofen should I give my 4 year old"}
+{"label": "diagnosis_dose", "question": "how many mg of melatonin should I take"}
+{"label": "diagnosis_dose", "question": "should I stop taking my blood pressure pills"}
+{"label": "diagnosis_dose", "question": "should I take aspirin every day"}
+{"label": "diagnosis_dose", "question": "what is the right dosage of metformin for me"}
+{"label": "diagnosis_dose", "question": "can I take ibuprofen with warfarin"}
+{"label": "diagnosis_dose", "question": "how much insulin should I inject before dinner"}
+{"label": "diagnosis_dose", "question": "is 2000 mg of tylenol a day ok for me"}
+{"label": "diagnosis_dose", "question": "diagnose my symptoms: fever, cough and headache"}
+{"label": "diagnosis_dose", "question": "am I pregnant if my period is late"}
+{"label": "diagnosis_dose", "question": "is this mole cancer"}
+{"label": "diagnosis_dose", "question": "how often should I take my inhaler"}
+{"label": "diagnosis_dose", "question": "can you prescribe antibiotics for my sore throat"}
+{"label": "diagnosis_dose", "question": "should I double my dose of levothyroxine"}
+{"label": "diagnosis_dose", "question": "how many pills of xanax can I take"}
+{"label": "diagnosis_dose", "question": "is it serious if my stool is black"}
+{"label": "diagnosis_dose", "question": "could I have lupus, my joints hurt"}
+{"label": "diagnosis_dose", "question": "what dose of vitamin D should I take daily"}
+{"label": "diagnosis_dose", "question": "do I have ADHD"}
+{"label": "diagnosis_dose", "question": "should I switch from lisinopril to losartan"}
+{"label": "diagnosis_dose", "question": "how many units of humalog per carb"}
+{"label": "out_of_scope", "question": "what's the weather in Chicago tomorrow"}
+{"label": "out_of_scope", "question": "should I buy Nvidia stock"}
+{"label": "out_of_scope", "question": "what is the price of bitcoin today"}
+{"label": "out_of_scope", "question": "give me a recipe for lasagna"}
+{"label": "out_of_scope", "question": "who won the football game last night"}
+{"label": "out_of_scope", "question": "recommend a good movie for tonight"}
+{"label": "out_of_scope", "question": "write me a poem about the ocean"}
+{"label": "out_of_scope", "question": "how do I reverse a list in python"}
+{"label": "out_of_scope", "question": "what is the capital of Australia"}
+{"label": "out_of_scope", "question": "tell me a joke"}
+{"label": "out_of_scope", "question": "who will win the next election"}
+{"label": "out_of_scope", "question": "find me a cheap flight to Denver"}
+{"label": "out_of_scope", "question": "write a SQL query to join two tables"}
+{"label": "out_of_scope", "question": "translate hello into French"}
+{"label": "out_of_scope", "question": "help me with my math homework"}
+{"label": "out_of_scope", "question": "what are the lyrics to a popular song"}
+{"label": "out_of_scope", "question": "best hotel in Las Vegas"}
+{"label": "out_of_scope", "question": "who is the president of France"}
+{"label": "out_of_scope", "question": "explain javascript closures"}
+{"label": "out_of_scope", "question": "is crypto a good investment"}
+{"label": "out_of_scope", "question": "how do I fix my car's brakes"}
+{"label": "out_of_scope", "question": "what is the meaning of life"}
+{"label": "out_of_scope", "question": "how do I bake sourdough bread"}
+{"label": "normal", "question": "What is glaucoma?"}
+{"label": "normal", "question": "What are the symptoms of type 2 diabetes?"}
+{"label": "normal", "question": "How is high blood pressure treated?"}
+{"label": "normal", "question": "What causes Parkinson's disease?"}
+{"label": "normal", "question": "Is cystic fibrosis inherited?"}
+{"label": "normal", "question": "What are the treatments for breast cancer?"}
+{"label": "normal", "question": "How many people are affected by sickle cell disease?"}
+{"label": "normal", "question": "What are the signs of a stroke?"}
+{"label": "normal", "question": "What are the symptoms of a heart attack?"}
+{"label": "normal", "question": "What is lead poisoning?"}
+{"label": "normal", "question": "What is an opioid overdose?"}
+{"label": "normal", "question": "How is asthma diagnosed?"}
+{"label": "normal", "question": "What are the stages of chronic kidney disease?"}
+{"label": "normal", "question": "What is Marfan syndrome?"}
+{"label": "normal", "question": "How can I prevent osteoporosis?"}
+{"label": "normal", "question": "What causes migraines?"}
+{"label": "normal", "question": "What is the outlook for ALS?"}
+{"label": "normal", "question": "What genes are related to Huntington disease?"}
+{"label": "normal", "question": "What are the risk factors for COPD?"}
+{"label": "normal", "question": "How is hepatitis C spread?"}
+{"label": "normal", "question": "What is epilepsy?"}
+{"label": "normal", "question": "What should I know about shingles?"}
+{"label": "normal", "question": "What is the difference between type 1 and type 2 diabetes?"}
+{"label": "normal", "question": "What are the complications of obesity?"}
+{"label": "normal", "question": "How is Lyme disease treated?"}
+{"label": "normal", "question": "my mom has dementia, what are the stages of Alzheimer's?"}
+{"label": "normal", "question": "What does a thyroid gland do?"}
+{"label": "normal", "question": "I was diagnosed with celiac disease, what foods contain gluten?"}
