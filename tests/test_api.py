@@ -53,3 +53,10 @@ def test_health_ready_metrics():
 def test_rejects_empty_question():
     c, _ = make()
     assert c.post("/ask", json={"question": ""}).status_code == 422
+
+
+def test_filters_reach_retriever_and_are_validated():
+    c, retriever = make()
+    ok = c.post("/ask", json={"question": "What is glaucoma?", "sources": ["GHR"], "qtypes": ["treatment"]})
+    assert ok.status_code == 200 and retriever.filters == (["GHR"], ["treatment"])
+    assert c.post("/ask", json={"question": "What is glaucoma?", "sources": ["WebMD"]}).status_code == 422

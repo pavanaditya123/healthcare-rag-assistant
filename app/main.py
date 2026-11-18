@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.answer import Assistant
 from app.cache import AnswerCache, RateLimiter, make_store
@@ -23,8 +23,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("api")
 
 
+SOURCES = {"GHR", "GARD", "NIDDK", "NINDS", "MPlusHealthTopics", "NIHSeniorHealth", "CancerGov", "NHLBI", "CDC"}
+
+
 class AskRequest(BaseModel):
     question: str = Field(min_length=3, max_length=1000)
+    # Optional metadata filters, e.g. {"sources": ["GHR"], "qtypes": ["treatment"]}
+    sources: list[str] | None = None
+    qtypes: list[str] | None = None
+
+    @field_validator("sources")
+    @classmethod
+    def known_sources(cls, v):
+        unknown = set(v or []) - SOURCES
+        if unknown:
+            raise ValueError(f"unknown sources {sorted(unknown)}; choose from {sorted(SOURCES)}")
+        return v
 
 
 def create_app(assistant: Assistant | None = None, store=None, s: Settings = settings) -> FastAPI:
@@ -57,13 +71,16 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
             raise HTTPException(429, "Too many requests, try again in a minute.")
 
         question = redact(body.question)  # nothing below this line sees raw PHI
-        cached = app.state.cache.get(question)
+        # Filters are part of the cache key: same question + different filter = different answer.
+        cache_q = f"{question}|{sorted(body.sources or [])}|{sorted(body.qtypes or [])}"
+        cached = app.state.cache.get(cache_q)
         if cached:
             result = {**cached, "cached": True}
         else:
-            result = {**app.state.assistant.answer(question).to_dict(), "cached": False}
+            answer = app.state.assistant.answer(question, sources=body.sources, qtypes=body.qtypes)
+            result = {**answer.to_dict(), "cached": False}
             if result["route"] != "degraded":  # don't cache outages; retry the LLM next time
-                app.state.cache.set(question, {k: v for k, v in result.items() if k != "cached"})
+                app.state.cache.set(cache_q, {k: v for k, v in result.items() if k != "cached"})
 
         REQUESTS.labels(result["route"]).inc()
         elapsed = time.perf_counter() - start

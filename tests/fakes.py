@@ -58,8 +58,9 @@ class FakeRetriever:
     def __init__(self, score=5.0, ready=True):
         self.score, self.ready, self.queries = score, ready, []
 
-    def search(self, q):
+    def search(self, q, sources=None, qtypes=None):
         self.queries.append(q)
+        self.filters = (sources, qtypes)
         payload = {"focus": "Glaucoma", "url": "https://nei.nih.gov/glaucoma", "text": "Glaucoma\nGlaucoma damages the optic nerve."}
         return SearchResult(reranked=[Hit("NEI_0000001_Sec1", self.score, payload)])
 

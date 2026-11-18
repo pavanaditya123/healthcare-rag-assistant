@@ -80,8 +80,9 @@ class Assistant:
     def __init__(self, retriever, llm, settings: Settings):
         self.retriever, self.llm, self.s = retriever, llm, settings
 
-    def answer(self, question: str) -> Answer:
-        """`question` must already be PHI-redacted (see main.py)."""
+    def answer(self, question: str, sources: list[str] | None = None, qtypes: list[str] | None = None) -> Answer:
+        """`question` must already be PHI-redacted (see main.py).
+        `sources` / `qtypes` are optional metadata filters (see retrieval.search)."""
         route = safety.classify(question)
         if route == safety.EMERGENCY:
             return Answer(route, safety.EMERGENCY_MESSAGE)
@@ -90,7 +91,7 @@ class Assistant:
         if route == safety.OUT_OF_SCOPE:
             return Answer(route, safety.OUT_OF_SCOPE_MESSAGE)
 
-        hits = self.retriever.search(question).reranked[: self.s.top_k]
+        hits = self.retriever.search(question, sources=sources, qtypes=qtypes).reranked[: self.s.top_k]
         if not hits or hits[0].score < self.s.min_rerank_score:
             return Answer("no_info", safety.NO_INFO_MESSAGE)
         sources = format_sources(hits)
