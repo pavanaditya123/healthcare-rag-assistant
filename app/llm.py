@@ -31,7 +31,7 @@ class GroqLLM:
         resp = self.http.post(
             self.s.groq_url,
             headers={"Authorization": f"Bearer {self.s.groq_api_key}"},
-            json={"model": model, "messages": messages, "temperature": 0, "max_tokens": 500},
+            json={"model": model, "messages": messages, "temperature": 0, "max_tokens": self.s.llm_max_tokens},
             timeout=self.s.llm_timeout_s,
         )
         resp.raise_for_status()

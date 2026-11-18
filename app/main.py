@@ -52,6 +52,11 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
 
             retriever = HybridRetriever(make_client(s), Encoders(s), s)
             app.state.assistant = Assistant(retriever, make_llm(s), s)
+            # Warm-up: the first ONNX run is slow (graph init, memory allocation),
+            # so pay that cost before readiness instead of on a user's request.
+            if retriever.is_ready():
+                retriever.search("what is diabetes")
+                log.info("warm-up query done")
         yield
 
     app = FastAPI(title="Healthcare RAG Assistant", lifespan=lifespan)
