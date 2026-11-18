@@ -124,6 +124,14 @@ the client replaces what it showed. This is the trade-off for faster first text.
 - **Stateless API** (FastAPI). State lives in Qdrant (index) and Redis (cache, rate-limit counters), so replicas can be added or killed at any time.
 - **Redis answer cache** keyed on the *redacted*, normalised question. Degraded answers are not cached, so the next request retries the LLM.
 - **Rate limiting**: fixed window per client per minute (Redis `INCR` + `EXPIRE`).
+- **Load shedding.** Embedding + reranking is CPU-bound ONNX work. The first CI load
+  test (20 concurrent users on a 2-vCPU runner) had 0% errors but **p95 = 20.9 s**:
+  every request ran the cross-encoder at once and they all slowed each other down
+  (rerank went from ~0.5 s alone to ~18 s under contention). Now each process runs at
+  most `MAX_INFLIGHT` searches with `ONNX_THREADS` threads; extra requests wait up to
+  `QUEUE_TIMEOUT_S` and then get a fast `503 Retry-After: 1`. Served requests stay fast,
+  `rag_shed_total` / `rag_inflight_searches` show the pressure, and the HPA adds pods.
+  CI runs two load phases: normal load (gated on p95) and overload (must shed, not slow down).
 - Both **fail open**: if Redis is down the API keeps answering, just without cache/limits.
 - **LLM resilience**: 10 s timeout → retry with backoff on timeout/429/5xx → fallback model (`llama-3.1-8b-instant`) → sources-only answer.
 - **Prometheus metrics** at `/metrics`: latency per stage (`sparse`, `dense`, `fusion`, `rerank`, `llm`, `llm_first_token`), end-to-end latency, routes taken, cache hit/miss, LLM errors per model, degraded answers by reason, rate-limited requests.
@@ -181,7 +189,7 @@ All settings are environment variables (see `app/config.py`): `QDRANT_URL`,
 `REDIS_URL`, `GROQ_API_KEY`, `LLM_PROVIDER` (`groq` / `stub`),
 `LLM_PRIMARY_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_TIMEOUT_S`, `LLM_RETRIES`,
 `LLM_MAX_TOKENS`, `MIN_RERANK_SCORE`, `TOP_K`, `CANDIDATES`, `RERANK_MAX_CHARS`,
-`CACHE_TTL_S`, `RATE_LIMIT_PER_MIN`.
+`CACHE_TTL_S`, `RATE_LIMIT_PER_MIN`, `MAX_INFLIGHT`, `QUEUE_TIMEOUT_S`, `ONNX_THREADS`.
 
 ## Not medical advice
 
