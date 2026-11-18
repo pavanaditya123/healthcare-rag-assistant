@@ -23,6 +23,7 @@ import random
 import sys
 import time
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from pathlib import Path
 
 from qdrant_client import QdrantClient
@@ -65,6 +66,8 @@ def liveqa_questions(questions_xml, qrels_txt, corpus_ids):
             continue
         orig = q.find("Original-Question")
         text = " ".join(f"{orig.findtext('SUBJECT') or ''}. {orig.findtext('MESSAGE') or ''}".split())
+        if not gold[qid] & corpus_ids:
+            continue
         out.append({"qid": qid, "question": text, "gold": gold[qid] & corpus_ids,
                     "paraphrase": (q.findtext("NIST-PARAPHRASE") or "").strip()})
     return out
@@ -77,13 +80,21 @@ def score_ranking(ids, gold, k=5):
     return {"recall@5": len(gold & set(top)) / len(gold), "hit@5": float(bool(gold & set(top))), "mrr": rr}
 
 
+def pct(values, p):
+    v = sorted(values)
+    return round(v[min(len(v) - 1, int(len(v) * p))], 1) if v else 0.0
+
+
 def evaluate(retriever, questions, field="question"):
     totals = {s: {"recall@5": 0.0, "hit@5": 0.0, "mrr": 0.0} for s in STAGES}
-    ceiling, top_scores, latency = 0.0, [], 0.0
+    ceiling, top_scores, total_ms = 0.0, [], []
+    stage_ms = {}
     for q in questions:
         t0 = time.perf_counter()
         res = retriever.search(q[field])
-        latency += time.perf_counter() - t0
+        total_ms.append(1000 * (time.perf_counter() - t0))
+        for stage, ms in res.timings_ms.items():
+            stage_ms.setdefault(stage, []).append(ms)
         for s in STAGES:
             for m, v in score_ranking([h.id for h in getattr(res, s)], q["gold"]).items():
                 totals[s][m] += v
@@ -94,7 +105,9 @@ def evaluate(retriever, questions, field="question"):
         "n": n,
         "stages": {s: {m: round(v / n, 4) for m, v in totals[s].items()} for s in STAGES},
         "fused_recall@20": round(ceiling / n, 4),
-        "mean_search_ms": round(1000 * latency / n, 1),
+        # per-stage latency; sparse and dense run in parallel, so total < sum
+        "latency_ms": {st: {"p50": pct(v, 0.5), "p95": pct(v, 0.95)}
+                       for st, v in {**stage_ms, "total": total_ms}.items()},
         "top_rerank_scores": top_scores,
     }
 
@@ -129,8 +142,23 @@ def table(name, r):
     for s in STAGES:
         m = r["stages"][s]
         lines.append(f"| {s} | {m['recall@5']:.3f} | {m['hit@5']:.3f} | {m['mrr']:.3f} |")
-    lines.append(f"\nReranker ceiling (fused recall@20): {r['fused_recall@20']:.3f} · mean search latency {r['mean_search_ms']} ms\n")
+    lat = r["latency_ms"]
+    lines.append(f"\nReranker ceiling (fused recall@20): {r['fused_recall@20']:.3f}\n")
+    lines.append("Latency ms (p50 / p95): " + "; ".join(f"{st} {v['p50']} / {v['p95']}" for st, v in lat.items()) + "\n")
     return "\n".join(lines)
+
+
+def speed_tradeoff(retriever, base, questions):
+    """Same index, different speed knobs: how much recall do we give up for speed?"""
+    rows = []
+    for cands, cap in [(20, 100_000), (20, 1000), (20, 500), (10, 1000)]:
+        retriever.s = replace(base, candidates_per_retriever=cands, rerank_max_chars=cap)
+        r = evaluate(retriever, questions)
+        rows.append({"candidates": cands, "rerank_max_chars": cap if cap < 100_000 else "full",
+                     "recall@5": r["stages"]["reranked"]["recall@5"], "mrr": r["stages"]["reranked"]["mrr"],
+                     "rerank_p50_ms": r["latency_ms"]["rerank"]["p50"], "total_p95_ms": r["latency_ms"]["total"]["p95"]})
+    retriever.s = base
+    return rows
 
 
 def main():
@@ -138,6 +166,9 @@ def main():
     ap.add_argument("--data", default="data")
     ap.add_argument("--sample", type=int, default=1000)
     ap.add_argument("--out", default="evals/results/retrieval.json")
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--index-path", default="data/eval_index")
+    ap.add_argument("--speed-sample", type=int, default=300, help="questions for the speed trade-off table")
     ap.add_argument("--answer-sample", type=int, default=30, help="questions sent to Groq if GROQ_API_KEY is set")
     ap.add_argument("--min-medquad-recall", type=float, default=0.0, help="CI gate on reranked recall@5")
     args = ap.parse_args()
@@ -145,10 +176,17 @@ def main():
 
     s = Settings(collection="eval")
     chunks = load_medquad(data / "MedQuAD")
-    retriever = HybridRetriever(QdrantClient(":memory:"), Encoders(s), s)
+    if args.limit:  # smoke tests only; reported numbers always use the full corpus
+        chunks = chunks[: args.limit]
+    # On-disk index, reused across runs (re-embedding 16k chunks is the slow part).
+    client = QdrantClient(path=args.index_path)
+    retriever = HybridRetriever(client, Encoders(s), s)
     t0 = time.time()
-    retriever.create_collection()
-    retriever.index(chunks)
+    if not (client.collection_exists(s.collection) and client.count(s.collection).count == len(chunks)):
+        retriever.create_collection()
+        for start in range(0, len(chunks), 2048):
+            retriever.index(chunks[start:start + 2048])
+            print(f"indexed {min(start + 2048, len(chunks))}/{len(chunks)}", flush=True)
     index_s = time.time() - t0
 
     corpus_ids = {c.id for c in chunks}
@@ -165,6 +203,7 @@ def main():
         "liveqa_paraphrased": evaluate(retriever, lq, field="paraphrase"),
     }
     results["liveqa"]["relevant_pairs"] = sum(len(q["gold"]) for q in lq)
+    results["speed_tradeoff"] = speed_tradeoff(retriever, s, mq[: args.speed_sample])
 
     oos = [r["question"] for r in load_safety_set() if r["label"] == OUT_OF_SCOPE]
     oos_scores = [retriever.search(q).reranked[0].score for q in oos]
@@ -181,7 +220,12 @@ def main():
         table("MedQuAD held-out questions", results["medquad"]),
         table(f"TREC LiveQA-Med real consumer questions — SMALL: {lq_r['n']} questions, {lq_r['relevant_pairs']} relevant pairs",
               lq_r),
-        table("LiveQA, NIST paraphrased questions (same 39)", results["liveqa_paraphrased"]),
+        table("LiveQA, NIST paraphrased versions of the same questions", results["liveqa_paraphrased"]),
+        f"#### Speed vs accuracy (MedQuAD, first {args.speed_sample} questions)", "",
+        "| candidates/retriever | rerank chars | recall@5 | MRR | rerank p50 ms | total p95 ms |", "|---|---|---|---|---|---|",
+        *[f"| {r['candidates']} | {r['rerank_max_chars']} | {r['recall@5']:.3f} | {r['mrr']:.3f} | {r['rerank_p50_ms']} | {r['total_p95_ms']} |"
+          for r in results["speed_tradeoff"]],
+        "",
         "#### Score threshold (top cross-encoder score)", "",
         "| threshold | in-domain refused | out-of-scope answered |", "|---|---|---|",
         *[f"| {r['threshold']} | {r['in_domain_refused']:.1%} | {r['out_of_scope_answered']:.1%} |" for r in results["threshold"]],
