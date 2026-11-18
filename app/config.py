@@ -28,7 +28,8 @@ class Settings:
     onnx_threads: int = int(_env("ONNX_THREADS", "0"))  # 0 = let ONNX decide
 
     # Retrieval knobs
-    candidates_per_retriever: int = int(_env("CANDIDATES", "20"))
+    # 10 vs 20: same recall@5 (0.926 vs 0.929, 300 MedQuAD questions), rerank 32% faster
+    candidates_per_retriever: int = int(_env("CANDIDATES", "10"))
     top_k: int = int(_env("TOP_K", "5"))
     # Characters of each passage the cross-encoder reads (speed vs accuracy, see evals)
     rerank_max_chars: int = int(_env("RERANK_MAX_CHARS", "1000"))
