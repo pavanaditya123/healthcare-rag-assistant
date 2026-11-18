@@ -4,6 +4,7 @@ Reciprocal Rank Fusion, then re-scored by a cross-encoder.
 Each stage's output is returned separately so the evals can measure what
 every stage contributes.
 """
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -28,6 +29,7 @@ class SearchResult:
     dense: list[Hit] = field(default_factory=list)
     fused: list[Hit] = field(default_factory=list)
     reranked: list[Hit] = field(default_factory=list)
+    timings_ms: dict = field(default_factory=dict)  # per-stage latency of this query
 
 
 class Encoders:
@@ -78,6 +80,9 @@ class HybridRetriever:
             # the term-frequency vectors from Qdrant/bm25 into real BM25 scores.
             sparse_vectors_config={SPARSE: models.SparseVectorParams(modifier=models.Modifier.IDF)},
         )
+        # Payload indexes make metadata filters fast (no full scan).
+        for key in ("source", "qtype"):
+            self.client.create_payload_index(self.s.collection, key, models.PayloadSchemaType.KEYWORD)
 
     def index(self, chunks, batch_size: int = 256):
         for start in range(0, len(chunks), batch_size):
@@ -90,7 +95,8 @@ class HybridRetriever:
                     id=point_id(c.id),
                     vector={DENSE: list(map(float, d)),
                             SPARSE: models.SparseVector(indices=sp.indices.tolist(), values=sp.values.tolist())},
-                    payload={"chunk_id": c.id, "source": c.source, "url": c.url, "focus": c.focus, "text": c.text},
+                    payload={"chunk_id": c.id, "source": c.source, "url": c.url, "focus": c.focus,
+                             "qtype": c.qtype, "text": c.text},
                 )
                 for c, d, sp in zip(batch, dense, sparse)
             ])
@@ -102,36 +108,58 @@ class HybridRetriever:
     def _to_hits(self, points) -> list[Hit]:
         return [Hit(p.payload["chunk_id"], p.score, p.payload) for p in points]
 
-    def sparse_search(self, query: str, k: int) -> list[Hit]:
-        with STAGE_LATENCY.labels("sparse").time():
-            q = next(iter(self.enc.sparse.query_embed(query)))
-            res = self.client.query_points(
-                self.s.collection, using=SPARSE, limit=k, with_payload=True,
-                query=models.SparseVector(indices=q.indices.tolist(), values=q.values.tolist()))
+    def sparse_search(self, query: str, k: int, flt=None) -> list[Hit]:
+        q = next(iter(self.enc.sparse.query_embed(query)))
+        res = self.client.query_points(
+            self.s.collection, using=SPARSE, limit=k, with_payload=True, query_filter=flt,
+            query=models.SparseVector(indices=q.indices.tolist(), values=q.values.tolist()))
         return self._to_hits(res.points)
 
-    def dense_search(self, query: str, k: int) -> list[Hit]:
-        with STAGE_LATENCY.labels("dense").time():
-            q = next(iter(self.enc.dense.query_embed(query)))
-            res = self.client.query_points(
-                self.s.collection, using=DENSE, limit=k, with_payload=True, query=list(map(float, q)))
+    def dense_search(self, query: str, k: int, flt=None) -> list[Hit]:
+        q = next(iter(self.enc.dense.query_embed(query)))
+        res = self.client.query_points(
+            self.s.collection, using=DENSE, limit=k, with_payload=True, query_filter=flt,
+            query=list(map(float, q)))
         return self._to_hits(res.points)
 
     def rerank(self, query: str, hits: list[Hit]) -> list[Hit]:
         if not hits:
             return []
-        with STAGE_LATENCY.labels("rerank").time():
-            scores = list(self.enc.reranker.rerank(query, [h.payload["text"] for h in hits]))
+        scores = list(self.enc.reranker.rerank(query, [h.payload["text"] for h in hits]))
         rescored = [Hit(h.id, float(s), h.payload) for h, s in zip(hits, scores)]
         return sorted(rescored, key=lambda h: h.score, reverse=True)
 
-    def search(self, query: str) -> SearchResult:
-        k = self.s.candidates_per_retriever
-        r = SearchResult(sparse=self.sparse_search(query, k), dense=self.dense_search(query, k))
-        with STAGE_LATENCY.labels("fusion").time():
-            r.fused = rrf([r.sparse, r.dense])[:k]
-        r.reranked = self.rerank(query, r.fused)
+    def search(self, query: str, sources: list[str] | None = None, qtypes: list[str] | None = None) -> SearchResult:
+        """Optional metadata filters, applied inside Qdrant to BOTH retrievers
+        (pre-filtering, so we still get k candidates after filtering):
+          sources: e.g. ["GHR", "GARD"] - only genetic / rare-disease pages
+          qtypes:  e.g. ["treatment"]   - only "How is X treated?" sections
+        """
+        k, r = self.s.candidates_per_retriever, SearchResult()
+        flt = make_filter(sources, qtypes)
+
+        def timed(stage, fn):
+            t0 = time.perf_counter()
+            out = fn()
+            elapsed = time.perf_counter() - t0
+            STAGE_LATENCY.labels(stage).observe(elapsed)
+            r.timings_ms[stage] = round(elapsed * 1000, 2)
+            return out
+
+        r.sparse = timed("sparse", lambda: self.sparse_search(query, k, flt))
+        r.dense = timed("dense", lambda: self.dense_search(query, k, flt))
+        r.fused = timed("fusion", lambda: rrf([r.sparse, r.dense])[:k])
+        r.reranked = timed("rerank", lambda: self.rerank(query, r.fused))
         return r
+
+
+def make_filter(sources=None, qtypes=None) -> models.Filter | None:
+    must = []
+    if sources:
+        must.append(models.FieldCondition(key="source", match=models.MatchAny(any=list(sources))))
+    if qtypes:
+        must.append(models.FieldCondition(key="qtype", match=models.MatchAny(any=list(qtypes))))
+    return models.Filter(must=must) if must else None
 
 
 def make_client(s: Settings) -> QdrantClient:

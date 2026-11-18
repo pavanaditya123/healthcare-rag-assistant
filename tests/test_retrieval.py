@@ -14,8 +14,8 @@ def test_rrf_rewards_agreement():
     assert abs(fused[0].score - (1 / 62 + 1 / 61)) < 1e-9
 
 
-def chunk(i, focus, answer):
-    return Chunk(f"GHR_{i:07d}_Sec1", "GHR", f"https://example.nih.gov/{i}", focus, "", "information", answer)
+def chunk(i, focus, answer, source="GHR", qtype="information"):
+    return Chunk(f"{source}_{i:07d}_Sec1", source, f"https://example.nih.gov/{i}", focus, "", qtype, answer)
 
 
 def test_hybrid_search_end_to_end_with_fake_models():
@@ -33,3 +33,21 @@ def test_hybrid_search_end_to_end_with_fake_models():
     assert r.is_ready()
     assert res.sparse[0].id == res.dense[0].id == res.fused[0].id == res.reranked[0].id == "GHR_0000001_Sec1"
     assert res.reranked[0].payload["url"] == "https://example.nih.gov/1"
+
+
+def test_metadata_filters_restrict_both_retrievers():
+    s = Settings(collection="test", candidates_per_retriever=5)
+    r = HybridRetriever(QdrantClient(":memory:"), FakeEncoders(), s)
+    r.create_collection()
+    r.index([
+        chunk(1, "diabetes", "Diabetes is treated with diet, exercise and insulin.", "NIDDK", "treatment"),
+        chunk(2, "diabetes", "Diabetes is a disease of high blood sugar.", "MPlusHealthTopics", "information"),
+        chunk(3, "diabetes", "Some forms of diabetes are inherited genetic conditions.", "GHR", "inheritance"),
+    ])
+
+    only_ghr = r.search("diabetes", sources=["GHR"])
+    treatment = r.search("diabetes", qtypes=["treatment"])
+
+    assert {h.payload["source"] for h in only_ghr.sparse + only_ghr.dense} == {"GHR"}
+    assert [h.id for h in treatment.reranked] == ["NIDDK_0000001_Sec1"]
+    assert set(only_ghr.timings_ms) == {"sparse", "dense", "fusion", "rerank"}
