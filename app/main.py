@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from app.answer import Assistant
 from app.cache import AnswerCache, RateLimiter, make_store
-from app.config import settings
+from app.config import Settings, settings
 from app.metrics import RATE_LIMITED, REQUEST_LATENCY, REQUESTS
 from app.safety import redact
 
@@ -27,7 +27,7 @@ class AskRequest(BaseModel):
     question: str = Field(min_length=3, max_length=1000)
 
 
-def create_app(assistant: Assistant | None = None, store=None) -> FastAPI:
+def create_app(assistant: Assistant | None = None, store=None, s: Settings = settings) -> FastAPI:
     """Dependencies can be injected so tests run without models or Redis."""
 
     @asynccontextmanager
@@ -36,15 +36,15 @@ def create_app(assistant: Assistant | None = None, store=None) -> FastAPI:
             from app.llm import make_llm
             from app.retrieval import Encoders, HybridRetriever, make_client
 
-            retriever = HybridRetriever(make_client(settings), Encoders(settings), settings)
-            app.state.assistant = Assistant(retriever, make_llm(settings), settings)
+            retriever = HybridRetriever(make_client(s), Encoders(s), s)
+            app.state.assistant = Assistant(retriever, make_llm(s), s)
         yield
 
     app = FastAPI(title="Healthcare RAG Assistant", lifespan=lifespan)
     app.state.assistant = assistant
-    app.state.store = store if store is not None else make_store(settings.redis_url)
-    app.state.cache = AnswerCache(app.state.store, settings.cache_ttl_s)
-    app.state.limiter = RateLimiter(app.state.store, settings.rate_limit_per_min)
+    app.state.store = store if store is not None else make_store(s.redis_url)
+    app.state.cache = AnswerCache(app.state.store, s.cache_ttl_s)
+    app.state.limiter = RateLimiter(app.state.store, s.rate_limit_per_min)
 
     @app.post("/ask")
     def ask(body: AskRequest, request: Request):
