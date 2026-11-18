@@ -6,6 +6,7 @@ every stage contributes.
 """
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from qdrant_client import QdrantClient, models
@@ -68,6 +69,7 @@ def point_id(chunk_id: str) -> str:
 class HybridRetriever:
     def __init__(self, client: QdrantClient, encoders, settings: Settings):
         self.client, self.enc, self.s = client, encoders, settings
+        self.pool = ThreadPoolExecutor(max_workers=8)
 
     # ---------- indexing ----------
     def create_collection(self):
@@ -125,7 +127,10 @@ class HybridRetriever:
     def rerank(self, query: str, hits: list[Hit]) -> list[Hit]:
         if not hits:
             return []
-        scores = list(self.enc.reranker.rerank(query, [h.payload["text"] for h in hits]))
+        # Cross-encoder cost grows with passage length, so only the start of each
+        # passage is scored (the topic line + opening sentences carry most signal).
+        cap = self.s.rerank_max_chars
+        scores = list(self.enc.reranker.rerank(query, [h.payload["text"][:cap] for h in hits]))
         rescored = [Hit(h.id, float(s), h.payload) for h, s in zip(hits, scores)]
         return sorted(rescored, key=lambda h: h.score, reverse=True)
 
@@ -146,8 +151,11 @@ class HybridRetriever:
             r.timings_ms[stage] = round(elapsed * 1000, 2)
             return out
 
-        r.sparse = timed("sparse", lambda: self.sparse_search(query, k, flt))
-        r.dense = timed("dense", lambda: self.dense_search(query, k, flt))
+        # BM25 and dense search are independent, so run them at the same time.
+        # (ONNX inference and Qdrant network calls release the GIL.)
+        sparse = self.pool.submit(timed, "sparse", lambda: self.sparse_search(query, k, flt))
+        dense = self.pool.submit(timed, "dense", lambda: self.dense_search(query, k, flt))
+        r.sparse, r.dense = sparse.result(), dense.result()
         r.fused = timed("fusion", lambda: rrf([r.sparse, r.dense])[:k])
         r.reranked = timed("rerank", lambda: self.rerank(query, r.fused))
         return r

@@ -22,6 +22,8 @@ class Settings:
     # Retrieval knobs
     candidates_per_retriever: int = int(_env("CANDIDATES", "20"))
     top_k: int = int(_env("TOP_K", "5"))
+    # Characters of each passage the cross-encoder reads (speed vs accuracy, see evals)
+    rerank_max_chars: int = int(_env("RERANK_MAX_CHARS", "1000"))
     # Below this cross-encoder score we say "no reliable info" (tuned in evals/)
     min_rerank_score: float = float(_env("MIN_RERANK_SCORE", "0.0"))
 
@@ -33,6 +35,7 @@ class Settings:
     fallback_model: str = _env("LLM_FALLBACK_MODEL", "llama-3.1-8b-instant")
     llm_timeout_s: float = float(_env("LLM_TIMEOUT_S", "10"))
     llm_retries: int = int(_env("LLM_RETRIES", "1"))
+    llm_max_tokens: int = int(_env("LLM_MAX_TOKENS", "300"))  # ~150-word answers; fewer tokens = faster
 
     # Redis cache + rate limit
     redis_url: str = _env("REDIS_URL", "")             # empty -> in-process fallback
