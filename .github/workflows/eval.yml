@@ -9,6 +9,7 @@ on:
 
 env:
   GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}   # second judge; optional
   FASTEMBED_CACHE_PATH: /home/runner/.cache/fastembed
 
 jobs:

@@ -29,3 +29,15 @@ def test_confirmed_vs_disputed_errors():
     r = summarise(items, ["j1", "j2"])
     assert r["errors"]["hallucination"] == {"confirmed": 1, "disputed": 1, "of": 2}
     assert r["agreement"]["hallucination"] == 0.5
+
+
+def test_gemini_judge_uses_its_own_endpoint_and_key(monkeypatch):
+    from app.config import Settings
+    from evals.judge_eval import GEMINI_URL, judge_client, pick_judges
+    monkeypatch.setenv("GEMINI_API_KEY", "g-test")
+    s = Settings(groq_api_key="q-test")
+    g, q = judge_client("gemini:gemini-2.5-flash", s), judge_client("openai/gpt-oss-120b", s)
+    assert (g.s.groq_url, g.s.groq_api_key, g.s.primary_model) == (GEMINI_URL, "g-test", "gemini-2.5-flash")
+    assert (q.s.groq_api_key, q.s.primary_model) == ("q-test", "openai/gpt-oss-120b")
+    monkeypatch.delenv("GEMINI_API_KEY")
+    assert pick_judges("openai/gpt-oss-120b,gemini:gemini-2.5-flash") == ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"]

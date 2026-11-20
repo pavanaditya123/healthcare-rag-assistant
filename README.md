@@ -241,8 +241,11 @@ metric definitions:
 | context_precision | Are the relevant passages ranked first? | noisy context → retrieval / threshold |
 | context_recall | Are the reference answer's facts in the passages? | retrieval miss → retrieval / chunking |
 
-- **Two different judge models grade every answer in parallel** (default
-  `openai/gpt-oss-120b` and `llama-3.3-70b-versatile`). One judge has its own biases;
+- **Two judges from different model families grade every answer in parallel**:
+  `openai/gpt-oss-120b` on Groq and Gemini 2.5 Flash (`gemini:` prefix, Google's
+  OpenAI-compatible endpoint, `GEMINI_API_KEY`). Neither is Llama, the generator's
+  family, because a judge tends to favour answers written in its own style. Without a Gemini
+  key it falls back to Llama 3.3 70B as the second judge and says so. One judge has its own biases;
   an error flagged by **both** is *confirmed* and fixed first, one flagged by a single
   judge is *disputed*, and the agreement rate per error type says how far to trust it.
 - One JSON judgment per answer returns all five metrics, instead of RAGAS's 4–8 calls,
@@ -250,6 +253,9 @@ metric definitions:
   `ragas` package. Every prompt is in the file.
 - Generation and judging run in a thread pool (`--workers`); retrieval runs first,
   sequentially, because it is CPU-bound.
+- Gemini's free tier may use what is sent to improve Google's products. That is fine
+  here (public NIH text), but not for real user questions: production traffic would need a
+  paid tier or a provider with a healthcare agreement.
 - It runs in the eval workflow once the `GROQ_API_KEY` secret is set. **No judge
   results yet:** the secret isn't set. The metric code is unit-tested and the
   pipeline was dry-run on the real index with a fake LLM.

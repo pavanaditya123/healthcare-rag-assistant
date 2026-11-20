@@ -1,6 +1,6 @@
 """Answer-quality eval with LLM-as-judge: RAGAS-style metrics, two judges in parallel.
 
-    GROQ_API_KEY=... python -m evals.judge_eval --medquad 30 --liveqa 20
+    GROQ_API_KEY=... GEMINI_API_KEY=... python -m evals.judge_eval --medquad 30 --liveqa 20
 
 Pipeline:
   1. retrieve for every question (local index, real models)
@@ -63,6 +63,29 @@ Return ONLY this JSON:
                         "in_passages": <true/false: stated in the retrieved passages?>}}]
 }}
 List at most 8 claims and at most 6 reference facts. Skip "see your doctor" style advice as a claim."""
+
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+
+
+def judge_client(spec: str, s: Settings) -> GroqLLM:
+    """"model" = a Groq model; "gemini:model" = Google's OpenAI-compatible endpoint.
+    Same client, different URL and key, so retries/backoff behave the same for both."""
+    provider, _, model = spec.rpartition(":") if spec.startswith("gemini:") else ("groq", "", spec)
+    url, key = (GEMINI_URL, os.getenv("GEMINI_API_KEY", "")) if provider == "gemini" else (s.groq_url, s.groq_api_key)
+    # Reasoning models (gpt-oss, Gemini 2.5) spend hidden tokens before the JSON; leave room.
+    js = replace(s, groq_url=url, groq_api_key=key, primary_model=model, fallback_model=model,
+                 llm_max_tokens=4000, llm_timeout_s=120, llm_retries=4)
+    return GroqLLM(js, backoff_s=4, extra_body={"response_format": {"type": "json_object"}})
+
+
+def pick_judges(spec: str) -> list[str]:
+    judges = spec.split(",")
+    if not os.getenv("GEMINI_API_KEY") and any(j.startswith("gemini:") for j in judges):
+        print("GEMINI_API_KEY not set: using llama-3.3-70b-versatile as the second judge "
+              "(same family as the generator, so expect it to be more lenient)")
+        judges = [("llama-3.3-70b-versatile" if j.startswith("gemini:") else j) for j in judges]
+    return judges
 
 
 # ---------- metrics from one judgment (pure functions, unit tested) ----------
@@ -204,8 +227,9 @@ def main():
     ap.add_argument("--index-path", default="data/eval_index")
     ap.add_argument("--medquad", type=int, default=30)
     ap.add_argument("--liveqa", type=int, default=20)
-    ap.add_argument("--judges", default="openai/gpt-oss-120b,llama-3.3-70b-versatile",
-                    help="two judge models, comma separated (use a different family from the generator)")
+    ap.add_argument("--judges", default="openai/gpt-oss-120b,gemini:gemini-2.5-flash",
+                    help="two judges, comma separated; 'gemini:<model>' uses GEMINI_API_KEY. "
+                         "Pick families different from the Llama generator.")
     ap.add_argument("--workers", type=int, default=4, help="parallel LLM calls")
     ap.add_argument("--out", default="evals/results/judge")
     args = ap.parse_args()
@@ -238,11 +262,8 @@ def main():
     print(f"generated answers; routes: {summarise(items, [])['routes']}")
 
     # 3. two judges, every (answer, judge) pair in parallel
-    judges = args.judges.split(",")
-    clients = {jm: GroqLLM(replace(s, primary_model=jm, fallback_model=jm, llm_max_tokens=1500,
-                                   llm_timeout_s=90, llm_retries=4),
-                           backoff_s=4, extra_body={"response_format": {"type": "json_object"}})
-               for jm in judges}
+    judges = pick_judges(args.judges)
+    clients = {jm: judge_client(jm, s) for jm in judges}
     for it in items:
         it["judgments"] = {}
     jobs = [(it, jm) for it in items if it["route"] == "answered" for jm in judges]
