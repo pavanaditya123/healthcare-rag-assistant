@@ -7,6 +7,7 @@ Resilience, in order:
   4. if both fail, raise LLMError -> caller serves a sources-only answer
 """
 import json
+import logging
 import os
 import time
 
@@ -16,6 +17,19 @@ from app.config import Settings
 from app.metrics import LLM_CALLS, STAGE_LATENCY
 
 RETRYABLE_STATUS = {408, 429, 500, 502, 503, 504}
+log = logging.getLogger(__name__)
+
+
+def describe(e: Exception) -> str:
+    """Short, key-free description of an LLM failure for the logs:
+    the HTTP status and the provider's error message, never request headers."""
+    if isinstance(e, httpx.HTTPStatusError):
+        try:
+            msg = e.response.json().get("error", {}).get("message", "")
+        except ValueError:
+            msg = e.response.text
+        return f"HTTP {e.response.status_code}: {str(msg)[:200]}"
+    return f"{type(e).__name__}: {str(e)[:200]}"
 
 
 class LLMError(Exception):
@@ -52,10 +66,12 @@ class GroqLLM:
                     return text, model
                 except httpx.HTTPStatusError as e:
                     LLM_CALLS.labels(model, "error").inc()
+                    log.warning("llm call failed model=%s attempt=%d %s", model, attempt, describe(e))
                     if e.response.status_code not in RETRYABLE_STATUS:
-                        break  # e.g. 400 model decommissioned: retrying won't help, try fallback
-                except (httpx.TimeoutException, httpx.TransportError, KeyError, ValueError):
+                        break  # e.g. 400 model decommissioned, 401 bad key: retrying won't help
+                except (httpx.TimeoutException, httpx.TransportError, KeyError, ValueError) as e:
                     LLM_CALLS.labels(model, "error").inc()
+                    log.warning("llm call failed model=%s attempt=%d %s", model, attempt, describe(e))
                 if attempt < self.s.llm_retries:
                     time.sleep(self.backoff_s * 2 ** attempt)
         raise LLMError("primary and fallback models failed")
@@ -91,6 +107,7 @@ class GroqLLM:
                 return
             except (httpx.HTTPError, KeyError, ValueError) as e:
                 LLM_CALLS.labels(model, "error").inc()
+                log.warning("llm stream failed model=%s %s", model, describe(e))
                 if started:
                     raise LLMError("stream broke mid-answer") from e
         raise LLMError("primary and fallback models failed")
