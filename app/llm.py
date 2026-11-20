@@ -35,6 +35,14 @@ def describe(e: Exception) -> str:
     return f"{type(e).__name__}: {str(e)[:200]}"
 
 
+def retry_after(resp: httpx.Response, cap_s: float = 30.0) -> float | None:
+    """Seconds to wait from a 429's Retry-After header (capped), if the provider sent one."""
+    try:
+        return min(float(resp.headers["retry-after"]), cap_s)
+    except (KeyError, ValueError):
+        return None
+
+
 class LLMError(Exception):
     pass
 
@@ -80,6 +88,10 @@ class GroqLLM:
                     log.warning("llm call failed model=%s attempt=%d %s", model, attempt, describe(e))
                     if e.response.status_code not in RETRYABLE_STATUS:
                         break  # e.g. 400 model decommissioned, 401 bad key: retrying won't help
+                    wait = retry_after(e.response)
+                    if wait is not None and attempt < self.s.llm_retries:
+                        time.sleep(wait)  # the provider told us how long; don't guess
+                        continue
                 except (httpx.TimeoutException, httpx.TransportError, KeyError, ValueError) as e:
                     LLM_CALLS.labels(model, "error").inc()
                     log.warning("llm call failed model=%s attempt=%d %s", model, attempt, describe(e))

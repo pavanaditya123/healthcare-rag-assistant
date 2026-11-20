@@ -6,6 +6,10 @@ on:
     branches: [main]
     paths: ["app/**", "evals/**", "requirements.txt", ".github/workflows/eval.yml"]
   workflow_dispatch:
+    inputs:
+      judges:
+        description: "Two judge models, comma separated ('gemini:<model>' uses GEMINI_API_KEY)"
+        default: "qwen/qwen3.8-27b,gemini:gemini-3.8-flash"
 
 env:
   GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -35,8 +39,9 @@ jobs:
         # ~0.5M Groq tokens per run, so manual only (Actions -> eval -> Run workflow),
         # not on every push. Skipped when the secret isn't set.
         if: github.event_name == 'workflow_dispatch' && env.GROQ_API_KEY != ''
-        run: python -m evals.judge_eval --medquad 30 --liveqa 20
+        run: python -m evals.judge_eval --medquad 30 --liveqa 20 --judges "${{ inputs.judges }}"
       - uses: actions/upload-artifact@v4
+        if: always()   # keep partial results (and paid-for answers) even when a step fails
         with:
           name: eval-results
           path: evals/results/

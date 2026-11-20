@@ -41,3 +41,15 @@ def test_gemini_judge_uses_its_own_endpoint_and_key(monkeypatch):
     assert (q.s.groq_api_key, q.s.primary_model) == ("q-test", "openai/gpt-oss-120b")
     monkeypatch.delenv("GEMINI_API_KEY")
     assert pick_judges("openai/gpt-oss-120b,gemini:gemini-3.8-flash") == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+
+
+def test_failed_judge_call_does_not_crash_the_report():
+    # The CI run of 2026-11-20 crashed with KeyError: 'faithfulness' when Gemini hit its quota.
+    from evals.judge_eval import errors_of, to_markdown
+    good = score({"claims": [{"claim": "a", "cited": [1], "supported_by": [1]}], "answer_relevance": 5,
+                  "passage_relevant": [True], "reference_facts": [{"fact": "x", "in_passages": True}]})
+    items = [{"route": "answered", "question": "q", "judgments": {"j1": good, "j2": {"judge_error": "HTTP 429"}}}]
+    assert errors_of({"judge_error": "HTTP 429"}) == set()
+    r = summarise(items, ["j1", "j2"])
+    assert r["judges"]["j2"]["judge_errors"] == 1
+    assert "LLM-as-judge" in to_markdown(r, items, ["j1", "j2"])

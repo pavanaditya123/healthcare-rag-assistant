@@ -77,3 +77,23 @@ def test_describe_handles_every_error_shape():
         resp = httpx.Response(404, json=body, request=req) if not isinstance(body, str) else httpx.Response(404, text=body, request=req)
         e = httpx.HTTPStatusError("x", request=req, response=resp)
         assert describe(e) == f"HTTP 404: {want}"
+
+
+def test_429_waits_for_retry_after_then_succeeds(monkeypatch):
+    import httpx
+    from app.config import Settings
+    from app.llm import GroqLLM, retry_after
+    waits, calls = [], {"n": 0}
+    monkeypatch.setattr("app.llm.time.sleep", waits.append)
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"retry-after": "7"}, json={"error": {"message": "TPM"}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok [1]"}}]})
+
+    llm = GroqLLM(Settings(llm_retries=1, groq_api_key="k"), http=httpx.Client(transport=httpx.MockTransport(handler)))
+    assert llm.complete([{"role": "user", "content": "hi"}]) == ("ok [1]", llm.s.primary_model)
+    assert waits == [7.0]
+    assert retry_after(httpx.Response(429, headers={"retry-after": "999"})) == 30.0
+    assert retry_after(httpx.Response(429)) is None
