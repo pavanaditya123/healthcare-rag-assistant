@@ -56,7 +56,8 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
             from app.retrieval import Encoders, HybridRetriever, make_client
 
             retriever = HybridRetriever(make_client(s), Encoders(s), s)
-            app.state.assistant = Assistant(retriever, make_llm(s), s)
+            context_cache = AnswerCache(app.state.store, s.context_cache_ttl_s, layer="context")
+            app.state.assistant = Assistant(retriever, make_llm(s), s, context_cache)
             # Warm-up: the first ONNX run is slow (graph init, memory allocation),
             # so pay that cost before readiness instead of on a user's request.
             if retriever.is_ready():

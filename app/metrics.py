@@ -11,7 +11,7 @@ REQUEST_LATENCY = Histogram(
     buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20),
 )
 REQUESTS = Counter("rag_requests_total", "Requests by route taken", ["route"])
-CACHE = Counter("rag_cache_total", "Answer cache lookups", ["result"])          # hit / miss / error
+CACHE = Counter("rag_cache_total", "Cache lookups", ["layer", "result"])  # answer|context, hit|miss|error
 LLM_CALLS = Counter("rag_llm_calls_total", "LLM calls", ["model", "outcome"])  # ok / error
 DEGRADED = Counter("rag_degraded_total", "Sources-only answers", ["reason"])
 RATE_LIMITED = Counter("rag_rate_limited_total", "Requests rejected by rate limiter")

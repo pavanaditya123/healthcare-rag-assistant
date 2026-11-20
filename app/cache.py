@@ -32,6 +32,9 @@ class MemoryStore:
     def setex(self, key, ttl, value):
         self.data[key], self.expiry[key] = value, time.time() + ttl
 
+    def delete(self, key):
+        self.data.pop(key, None), self.expiry.pop(key, None)
+
     def incr(self, key):
         self.data[key] = int(self.get(key) or 0) + 1
         return self.data[key]
@@ -50,34 +53,45 @@ def make_store(redis_url: str):
     return redis.Redis.from_url(redis_url, socket_timeout=0.5, socket_connect_timeout=0.5)
 
 
-def cache_key(question: str) -> str:
+def cache_key(question: str, layer: str = "answer") -> str:
     normalized = " ".join(question.lower().split())
-    return "answer:v1:" + hashlib.sha256(normalized.encode()).hexdigest()
+    return f"{layer}:v1:" + hashlib.sha256(normalized.encode()).hexdigest()
 
 
 class AnswerCache:
-    def __init__(self, store, ttl_s: int):
-        self.store, self.ttl_s = store, ttl_s
+    """Two layers share this class (different key prefix and TTL):
+      answer  - the final validated answer: a hit skips retrieval AND the LLM
+      context - the reranked passages: a hit skips retrieval (the slow, CPU part)
+    """
+
+    def __init__(self, store, ttl_s: int, layer: str = "answer"):
+        self.store, self.ttl_s, self.layer = store, ttl_s, layer
 
     def get(self, question: str) -> dict | None:
         if self.ttl_s <= 0:
             return None
         try:
-            raw = self.store.get(cache_key(question))
+            raw = self.store.get(cache_key(question, self.layer))
         except Exception as e:  # redis.RedisError, connection refused, ...
             log.warning("cache get failed: %s", e)
-            CACHE.labels("error").inc()
+            CACHE.labels(self.layer, "error").inc()
             return None
-        CACHE.labels("hit" if raw else "miss").inc()
+        CACHE.labels(self.layer, "hit" if raw else "miss").inc()
         return json.loads(raw) if raw else None
 
     def set(self, question: str, value: dict):
         if self.ttl_s <= 0:
             return
         try:
-            self.store.setex(cache_key(question), self.ttl_s, json.dumps(value))
+            self.store.setex(cache_key(question, self.layer), self.ttl_s, json.dumps(value))
         except Exception as e:
             log.warning("cache set failed: %s", e)
+
+    def delete(self, question: str):
+        try:
+            self.store.delete(cache_key(question, self.layer))
+        except Exception as e:
+            log.warning("cache delete failed: %s", e)
 
 
 class RateLimiter:

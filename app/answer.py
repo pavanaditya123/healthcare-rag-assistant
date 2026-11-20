@@ -77,8 +77,27 @@ def sources_only(hits: list[Hit]) -> str:
 
 
 class Assistant:
-    def __init__(self, retriever, llm, settings: Settings):
+    def __init__(self, retriever, llm, settings: Settings, context_cache=None):
         self.retriever, self.llm, self.s = retriever, llm, settings
+        self.context_cache = context_cache  # optional AnswerCache(layer="context")
+
+    def retrieve(self, question, sources, qtypes) -> list[Hit]:
+        """Top-k reranked hits, from the context cache when possible.
+        Cached BEFORE the score threshold, so tuning MIN_RERANK_SCORE needs no flush."""
+        version = getattr(self.retriever, "index_version", lambda: "")()
+        key = f"{version}|{question}|{sorted(sources or [])}|{sorted(qtypes or [])}"
+        if self.context_cache:
+            cached = self.context_cache.get(key)
+            if cached is not None:
+                return [Hit(h["id"], h["score"], h["payload"]) for h in cached]
+        hits = self.retriever.search(question, sources=sources, qtypes=qtypes).reranked[: self.s.top_k]
+        if self.context_cache:
+            # Store only the text the prompt uses, to keep Redis small.
+            self.context_cache.set(key, [
+                {"id": h.id, "score": h.score,
+                 "payload": {**h.payload, "text": h.payload["text"][:MAX_SOURCE_CHARS]}}
+                for h in hits])
+        return hits
 
     def _route_and_retrieve(self, question, sources, qtypes):
         """Shared by answer() and stream(): returns (final Answer, None) when we
@@ -90,7 +109,7 @@ class Assistant:
             return Answer(route, safety.DIAGNOSIS_DOSE_MESSAGE), None
         if route == safety.OUT_OF_SCOPE:
             return Answer(route, safety.OUT_OF_SCOPE_MESSAGE), None
-        hits = self.retriever.search(question, sources=sources, qtypes=qtypes).reranked[: self.s.top_k]
+        hits = self.retrieve(question, sources, qtypes)
         if not hits or hits[0].score < self.s.min_rerank_score:
             return Answer("no_info", safety.NO_INFO_MESSAGE), None
         return None, hits

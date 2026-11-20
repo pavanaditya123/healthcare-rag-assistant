@@ -47,3 +47,13 @@ def test_llm_outage_returns_sources_only():
 def test_uncited_llm_answer_is_rejected():
     a = Assistant(FakeRetriever(), FakeLLM(text="Glaucoma is bad."), S).answer("What is glaucoma?")
     assert a.route == "degraded"
+
+
+def test_context_cache_skips_retrieval_but_still_calls_llm():
+    from app.cache import AnswerCache, MemoryStore
+    from tests.fakes import FakeLLM, FakeRetriever
+    retriever, llm = FakeRetriever(), FakeLLM()
+    a = Assistant(retriever, llm, Settings(), AnswerCache(MemoryStore(), 60, layer="context"))
+    first, second = a.answer("What is glaucoma?"), a.answer("what is GLAUCOMA?")
+    assert len(retriever.queries) == 1 and llm.calls == 2   # retrieval cached, LLM not
+    assert first.sources == second.sources and second.route == "answered"
