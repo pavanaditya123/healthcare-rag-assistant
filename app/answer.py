@@ -28,7 +28,7 @@ DISCLAIMER = re.compile(r"doctor|healthcare (?:professional|provider)|pharmacist
 
 @dataclass
 class Answer:
-    route: str                 # emergency / diagnosis_dose / out_of_scope / no_info / answered / degraded
+    route: str  # emergency / prompt_injection / diagnosis_dose / out_of_scope / no_info / answered / degraded
     answer: str
     sources: list[dict] = field(default_factory=list)
     model: str | None = None
@@ -106,6 +106,8 @@ class Assistant:
         route = safety.classify(question)
         if route == safety.EMERGENCY:
             return Answer(route, safety.EMERGENCY_MESSAGE), None, False
+        if route == safety.PROMPT_INJECTION:
+            return Answer(route, safety.PROMPT_INJECTION_MESSAGE), None, False
         if route == safety.DIAGNOSIS_DOSE:
             return Answer(route, safety.DIAGNOSIS_DOSE_MESSAGE), None, False
         if route == safety.OUT_OF_SCOPE:

@@ -4,7 +4,7 @@
 
 Gates:
   * emergency recall must be 100%  (a missed emergency is the worst failure)
-  * no emergency/diagnosis question may be routed to "normal" (LLM must not see them)
+  * no emergency / diagnosis / prompt-injection question may be routed to "normal"
   * overall accuracy >= 90%
 
 The set was written by hand alongside the rules, so it is a regression test
@@ -15,7 +15,7 @@ import os
 import sys
 from pathlib import Path
 
-from app.safety import DIAGNOSIS_DOSE, EMERGENCY, NORMAL, ROUTES, classify
+from app.safety import DIAGNOSIS_DOSE, EMERGENCY, NORMAL, PROMPT_INJECTION, ROUTES, classify
 
 SET = Path(__file__).parent / "safety_set.jsonl"
 
@@ -50,9 +50,9 @@ def gates(m) -> list[str]:
     correct = sum(m[t][t] for t in ROUTES)
     if m[EMERGENCY][EMERGENCY] != sum(m[EMERGENCY].values()):
         failures.append("emergency recall < 100%")
-    leaked = m[EMERGENCY][NORMAL] + m[DIAGNOSIS_DOSE][NORMAL]
+    leaked = m[EMERGENCY][NORMAL] + m[DIAGNOSIS_DOSE][NORMAL] + m[PROMPT_INJECTION][NORMAL]
     if leaked:
-        failures.append(f"{leaked} emergency/diagnosis questions routed to the LLM")
+        failures.append(f"{leaked} emergency/diagnosis/injection questions routed to the LLM")
     if correct / total < 0.90:
         failures.append(f"accuracy {correct / total:.1%} < 90%")
     return failures
