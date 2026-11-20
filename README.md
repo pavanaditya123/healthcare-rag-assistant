@@ -190,7 +190,15 @@ curl -s localhost:8000/ask -H 'content-type: application/json' \
 # streaming (server-sent events): sources -> tokens -> validated "done"
 curl -N localhost:8000/ask/stream -H 'content-type: application/json' \
   -d '{"question": "What causes glaucoma?"}'
+
+# thumbs up / down on an answer, using the request_id it returned
+curl -s localhost:8000/feedback -H 'content-type: application/json' \
+  -d '{"request_id": "<id from /ask>", "rating": "down", "comment": "did not answer my question"}'
 ```
+
+Every response carries a `request_id` (also the `X-Request-ID` header; a caller's
+own `X-Request-ID` is reused). Logs are one JSON object per line with that id, so a
+complaint about one answer leads straight to its log lines.
 
 **Metadata filtering.** Each chunk stores `source` (GHR, GARD, NIDDK, …) and
 `qtype` (information, causes, treatment, inheritance, …) with Qdrant payload
@@ -198,11 +206,73 @@ indexes. Filters are applied *before* the vector search (pre-filtering), so you
 still get the full candidate list after filtering. Unknown sources are rejected
 with 422, and filters are part of the cache key.
 
+## Human feedback loop
+
+Users rate answers with `/feedback`. Each answered request leaves a trace for 24 h
+(redacted question, route, top rerank score, source ids), and the vote is joined to
+it, so we know which answer, at which retrieval score, was rated.
+
+| What feedback changes | When | How |
+|---|---|---|
+| A bad cached answer stops being served | Immediately | A thumbs-down evicts that answer from the cache; the next user gets a fresh one |
+| The "no reliable info" cut-off (`MIN_RERANK_SCORE`) | Offline, by a person | `scripts/tune_threshold.py` picks the cut-off that maximises *good answers kept − 3 × bad answers kept* (a wrong health answer costs more than a refusal) |
+| The eval sets | Offline, by a person | Down-voted questions are exported to a review file; reviewed ones become new eval cases, so CI catches the regression next time |
+
+```bash
+REDIS_URL=redis://localhost:6379/0 python scripts/tune_threshold.py
+```
+
+Votes **don't change the ranking automatically.** In a health app, unreviewed votes
+can be wrong or gamed (pushing a passage up for everyone), so they go through a
+person and the evals first. Feedback counts are a metric (`rag_feedback_total{rating}`),
+so a jump in down-votes after a deploy shows up on a dashboard.
+
+## Answer quality: LLM-as-judge
+
+Retrieval metrics say whether the right passage was found, not whether the answer
+is *grounded* in it. `evals/judge_eval.py` grades generated answers with RAGAS's
+metric definitions:
+
+| Metric | Question it answers | Error type it flags → fix |
+|---|---|---|
+| faithfulness | Is every claim in the answer stated in the passages? | hallucination → prompt / generation |
+| citation_accuracy | Does each `[n]` really support its claim? | miscitation → prompt / validator |
+| answer_relevancy | Does it answer the question asked? | off-target answer → prompt |
+| context_precision | Are the relevant passages ranked first? | noisy context → retrieval / threshold |
+| context_recall | Are the reference answer's facts in the passages? | retrieval miss → retrieval / chunking |
+
+- **Two different judge models grade every answer in parallel** (default
+  `openai/gpt-oss-120b` and `llama-3.3-70b-versatile`). One judge has its own biases;
+  an error flagged by **both** is *confirmed* and fixed first, one flagged by a single
+  judge is *disputed*, and the agreement rate per error type says how far to trust it.
+- One JSON judgment per answer returns all five metrics, instead of RAGAS's 4–8 calls,
+  to fit Groq's free tier. That is also why this uses RAGAS's definitions, not the
+  `ragas` package. Every prompt is in the file.
+- Generation and judging run in a thread pool (`--workers`); retrieval runs first,
+  sequentially, because it is CPU-bound.
+- It runs in the eval workflow once the `GROQ_API_KEY` secret is set. **No judge
+  results yet:** the secret isn't set. The metric code is unit-tested and the
+  pipeline was dry-run on the real index with a fake LLM.
+
+## End-to-end check
+
+`scripts/e2e_check.py` drives a running server through every feature (23 checks):
+health and readiness, a cited answer from NIH sources, request ids, answer cache hit,
+thumbs-down eviction followed by a context-cache hit, streaming order, the request id
+on the stream, metadata filters, 422 on unknown sources, the emergency / dosing /
+out-of-scope routes, PHI redaction in the cache key, and exported metrics. CI runs it
+against real Qdrant and Redis with 2 workers, so caching and feedback are shown to
+work *across processes*.
+Locally, on the full 16,407-chunk index with the real models: **23/23 pass**. Answer
+cache 878 ms → 2 ms. After a thumbs-down, the regenerated answer took 303 ms (only
+the stubbed 300 ms LLM), because the context cache skipped retrieval.
+
 ## Latency: what makes answers fast
 
 | Technique | Why it helps |
 |---|---|
 | Redis answer cache | Repeated questions skip retrieval and the LLM entirely (ms instead of seconds) |
+| Redis context cache | The reranked passages are cached separately (24 h). An expired answer, a down-voted answer or an LLM retry re-runs only the LLM, not retrieval (~98% of search time). Cached before the score cut-off, so tuning `MIN_RERANK_SCORE` needs no flush; ingest clears it after a re-index |
 | BM25 and dense search run in parallel | They are independent; total = max(sparse, dense) instead of the sum |
 | Reranker reads at most `RERANK_MAX_CHARS` (1,000) per passage | Cross-encoder cost grows with tokens; the eval's speed table shows the recall cost of each setting |
 | Candidates per retriever (`CANDIDATES`, 10) | Fewer candidates = fewer cross-encoder pairs; same speed table |
@@ -232,6 +302,22 @@ the client replaces what it showed. This is the trade-off for faster first text.
 - **LLM resilience**: 10 s timeout → retry with backoff on timeout/429/5xx → fallback model (`llama-3.1-8b-instant`) → sources-only answer.
 - **Prometheus metrics** at `/metrics`: latency per stage (`sparse`, `dense`, `fusion`, `rerank`, `llm`, `llm_first_token`), end-to-end latency, routes taken, cache hit/miss, LLM errors per model, degraded answers by reason, rate-limited requests.
 - **Kubernetes**: Deployment with readiness (`/readyz`: models loaded + index exists) and liveness probes, CPU-based HPA (2–10 pods, 70% target; retrieval and rerank are CPU-bound ONNX), Qdrant StatefulSet, Redis, one-off ingest Job. Models are baked into the image so new pods don't download anything.
+
+## Production gaps (what this does not do yet)
+
+Built the way a production service is built, but proven only on one CI machine.
+Before real traffic it would need:
+
+| Gap | Why it matters |
+|---|---|
+| ~1.5 req/s per pod; the CPU reranker is the bottleneck | 100 req/s would be ~70 pods. A GPU or hosted reranker is the real fix, not more pods |
+| Manifests not yet run on a real cluster | The load numbers are for one machine |
+| HPA scales on CPU | In-flight searches / shed rate is the truer "pod is full" signal |
+| Single Qdrant and Redis, no backups, re-index is not zero-downtime | Single points of failure |
+| No auth or TLS; rate limit is per IP | Anyone who can reach it can use it |
+| Metrics only: no tracing, alerts or SLOs | Problems are found by users, not alerts |
+| Regex PHI redaction, third-party LLM | Real patient data needs a HIPAA agreement with the provider, audit logs and encryption, or a self-hosted model |
+| 100 hand-written safety questions | A regression test, not clinical validation |
 
 ## Run it
 
@@ -270,12 +356,14 @@ app/
   safety.py      PHI redaction, router, fixed safety messages
   llm.py         Groq client: timeout, retry, fallback; stub for tests
   answer.py      pipeline: route -> retrieve -> threshold -> LLM -> validate citations
-  cache.py       Redis answer cache + rate limiter (fail open)
+  cache.py       Redis answer + context caches, rate limiter (fail open)
+  feedback.py    request traces, votes, threshold choice from votes
+  logs.py        JSON logs with request id
   metrics.py     Prometheus metrics
   main.py        FastAPI app
   ingest.py      build the index
-evals/           retrieval, safety and LLM-answer evals
-scripts/         data download, load test
+evals/           retrieval, safety, LLM-answer and LLM-as-judge evals
+scripts/         data download, load test, end-to-end check, threshold tuning from feedback
 deploy/          k8s manifests, Prometheus config
 ```
 
@@ -285,7 +373,7 @@ All settings are environment variables (see `app/config.py`): `QDRANT_URL`,
 `REDIS_URL`, `GROQ_API_KEY`, `LLM_PROVIDER` (`groq` / `stub`),
 `LLM_PRIMARY_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_TIMEOUT_S`, `LLM_RETRIES`,
 `LLM_MAX_TOKENS`, `MIN_RERANK_SCORE`, `TOP_K`, `CANDIDATES`, `RERANK_MAX_CHARS`,
-`CACHE_TTL_S`, `RATE_LIMIT_PER_MIN`, `MAX_INFLIGHT`, `QUEUE_TIMEOUT_S`, `ONNX_THREADS`.
+`CACHE_TTL_S`, `CONTEXT_CACHE_TTL_S`, `RATE_LIMIT_PER_MIN`, `MAX_INFLIGHT`, `QUEUE_TIMEOUT_S`, `ONNX_THREADS`.
 
 ## Not medical advice
 
