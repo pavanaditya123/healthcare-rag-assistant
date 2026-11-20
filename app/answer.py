@@ -1,14 +1,15 @@
 """The question -> answer pipeline.
 
-    redact PHI -> route -> retrieve -> threshold -> LLM -> validate citations
-                    |                      |          |           |
-                 emergency /           "no reliable  LLM down /  invalid ->
-                 refusal (no LLM)       info"        sources-only answer
+    redact PHI -> route -> retrieve -> threshold -> LLM -> output guardrails -> + disclaimer
+                    |                      |          |              |
+                 emergency /           "no reliable  LLM down /   invalid citation / unsafe /
+                 injection /            info"        error         ungrounded -> sources-only
+                 refusal (no LLM)
 """
 import re
 from dataclasses import asdict, dataclass, field
 
-from app import safety
+from app import guardrails, safety
 from app.config import Settings
 from app.llm import LLMError
 from app.metrics import DEGRADED
@@ -33,6 +34,7 @@ class Answer:
     sources: list[dict] = field(default_factory=list)
     model: str | None = None
     context_cached: bool = False  # passages came from the context cache (retrieval skipped)
+    blocked_by: str | None = None  # which guardrail replaced the LLM text, if any
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -117,6 +119,26 @@ class Assistant:
             return Answer("no_info", safety.NO_INFO_MESSAGE, context_cached=ctx), None, ctx
         return None, hits, ctx
 
+    def finish(self, text: str, hits: list[Hit], srcs: list[dict], model, ctx: bool) -> Answer:
+        """Output guardrails, shared by /ask and /ask/stream. Any failure means
+        the user gets the NIH passages verbatim instead of generated text."""
+        passages = [h.payload["text"][:MAX_SOURCE_CHARS] for h in hits]
+        if not citations_valid(text, len(hits)):
+            reason = "invalid_citations"
+        elif guardrails.unsafe_output(text):
+            reason = "unsafe_output:" + guardrails.unsafe_output(text)
+        elif self.s.grounding_min_support and guardrails.ungrounded(text, passages, self.s.grounding_min_support):
+            reason = "ungrounded"
+        else:
+            return Answer("answered", guardrails.add_disclaimer(text.strip()), srcs, model, ctx)
+        DEGRADED.labels(reason.split(":")[0]).inc()
+        return Answer("degraded", guardrails.add_disclaimer(sources_only(hits)), srcs, model, ctx, blocked_by=reason)
+
+    def degraded_llm_down(self, hits, srcs, model, ctx) -> Answer:
+        DEGRADED.labels("llm_unavailable").inc()
+        return Answer("degraded", guardrails.add_disclaimer(sources_only(hits)), srcs, model, ctx,
+                      blocked_by="llm_unavailable")
+
     def stream(self, question: str, sources=None, qtypes=None):
         """Yield events for /ask/stream:
           {"type": "sources", ...}  as soon as retrieval is done (~fast)
@@ -137,14 +159,12 @@ class Assistant:
                 text += delta
                 yield {"type": "token", "text": delta}
         except LLMError:
-            DEGRADED.labels("llm_unavailable").inc()
-            yield {"type": "done", **Answer("degraded", sources_only(hits), srcs, model, ctx).to_dict()}
+            yield {"type": "done", **self.degraded_llm_down(hits, srcs, model, ctx).to_dict()}
             return
-        if not citations_valid(text, len(hits)):
-            DEGRADED.labels("invalid_citations").inc()
-            yield {"type": "done", **Answer("degraded", sources_only(hits), srcs, model, ctx).to_dict()}
-            return
-        yield {"type": "done", **Answer("answered", text.strip(), srcs, model, ctx).to_dict()}
+        final = self.finish(text, hits, srcs, model, ctx)
+        if final.route == "answered":  # the disclaimer is part of what the user sees
+            yield {"type": "token", "text": "\n\n" + guardrails.DISCLAIMER_TEXT}
+        yield {"type": "done", **final.to_dict()}
 
     def answer(self, question: str, sources: list[str] | None = None, qtypes: list[str] | None = None) -> Answer:
         """`question` must already be PHI-redacted (see main.py).
@@ -157,9 +177,5 @@ class Assistant:
         try:
             text, model = self.llm.complete(build_messages(question, hits))
         except LLMError:
-            DEGRADED.labels("llm_unavailable").inc()
-            return Answer("degraded", sources_only(hits), sources, context_cached=ctx)
-        if not citations_valid(text, len(hits)):
-            DEGRADED.labels("invalid_citations").inc()
-            return Answer("degraded", sources_only(hits), sources, model, ctx)
-        return Answer("answered", text, sources, model, ctx)
+            return self.degraded_llm_down(hits, sources, None, ctx)
+        return self.finish(text, hits, sources, model, ctx)

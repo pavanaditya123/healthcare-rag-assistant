@@ -97,20 +97,29 @@ class GroqLLM:
 
 
 class StubLLM:
-    """Deterministic stand-in for tests and load tests (no network, no key)."""
+    """Deterministic stand-in for tests and load tests (no network, no key).
+
+    Quotes the first sentence of source [1], so its answers are grounded and
+    exercise the same output guardrails a real answer goes through.
+    """
 
     def __init__(self, latency_s: float = 0.0):
         self.latency_s = latency_s
 
+    @staticmethod
+    def text_for(messages: list[dict]) -> str:
+        user = messages[-1]["content"]
+        source = user.split("[1] ", 1)[1].split("\n", 1)[1] if "[1] " in user else "No sources."
+        first = source.split("\n[2]")[0].replace("\n", " ").split(". ")[0][:300].rstrip(".")
+        return f"{first}. [1]"
+
     def complete(self, messages: list[dict]) -> tuple[str, str]:
         time.sleep(self.latency_s)  # simulate LLM latency in load tests
-        return self.TEXT, "stub"
-
-    TEXT = "Stubbed answer based on the retrieved NIH passage. [1]"
+        return self.text_for(messages), "stub"
 
     def stream(self, messages: list[dict]):
         time.sleep(self.latency_s / 3)  # first token arrives before the full answer
-        for word in self.TEXT.split(" "):
+        for word in self.text_for(messages).split(" "):
             yield word + " ", "stub"
 
 
