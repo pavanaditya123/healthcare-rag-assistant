@@ -3,6 +3,10 @@ name: LLM smoke test
 # Manual only: one tiny request per model to check keys and model names.
 on:
   workflow_dispatch:
+    inputs:
+      judges:
+        description: "Two judge models, comma separated ('gemini:<model>' uses GEMINI_API_KEY)"
+        default: "qwen/qwen3.8-27b,gemini:gemini-3.5-flash-lite"
 
 jobs:
   smoke:
@@ -17,3 +21,5 @@ jobs:
         with: {python-version: "3.12", cache: pip}
       - run: pip install -r requirements.txt
       - run: python scripts/llm_smoke.py
+        env:
+          JUDGES: ${{ inputs.judges }}

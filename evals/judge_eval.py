@@ -78,7 +78,7 @@ def judge_client(spec: str, s: Settings) -> GroqLLM:
                  llm_max_tokens=4000, llm_timeout_s=120, llm_retries=4)
     extra = {"response_format": {"type": "json_object"}}
     if provider == "gemini":
-        extra["reasoning_effort"] = "low"  # default thinking took ~88 s per judgment in the smoke test
+        extra["reasoning_effort"] = "low"  # gemini-3.8-flash took ~80 s per judgment and ran out of free quota; flash-lite: <1 s
     return GroqLLM(js, backoff_s=4, extra_body=extra)
 
 
@@ -128,10 +128,27 @@ ERRORS = {
 
 
 def errors_of(m: dict) -> set[str]:
-    return {name for name, test in ERRORS.items() if m and test(m)}
+    if not m or "judge_error" in m:  # a failed judge call says nothing about the answer
+        return set()
+    return {name for name, test in ERRORS.items() if test(m)}
 
 
 # ---------- running ----------
+class RecordingLLM(GroqLLM):
+    """Keeps the raw LLM text per question, so answers that a guardrail blocked
+    can still be inspected ("why did citation validation fail?")."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.raw = {}
+
+    def complete(self, messages):
+        text, model = super().complete(messages)
+        question = messages[-1]["content"].split("Question: ", 1)[-1].split("\n\nSources:", 1)[0]
+        self.raw[question] = text
+        return text, model
+
+
 class Precomputed:
     """Retriever stand-in that returns hits we already computed (so generation can run in threads)."""
 
@@ -249,10 +266,11 @@ def main():
     ap.add_argument("--index-path", default="data/eval_index")
     ap.add_argument("--medquad", type=int, default=30)
     ap.add_argument("--liveqa", type=int, default=20)
-    ap.add_argument("--judges", default="qwen/qwen3.8-27b,gemini:gemini-3.8-flash",
+    ap.add_argument("--judges", default="qwen/qwen3.8-27b,gemini:gemini-3.5-flash-lite",
                     help="two judges, comma separated; 'gemini:<model>' uses GEMINI_API_KEY. "
                          "Pick families different from the Llama generator.")
-    ap.add_argument("--workers", type=int, default=4, help="parallel LLM calls")
+    ap.add_argument("--workers", type=int, default=2,
+                    help="parallel LLM calls (Groq free tier: 8,000 tokens/min for gpt-oss-120b)")
     ap.add_argument("--out", default="evals/results/judge")
     args = ap.parse_args()
     if not os.getenv("GROQ_API_KEY"):
@@ -272,12 +290,14 @@ def main():
     print(f"retrieved {len(items)} questions in {time.time() - t0:.0f}s")
 
     # 2. generation (network-bound, parallel)
-    gen = Assistant(Precomputed(hits), GroqLLM(replace(s, llm_retries=3), backoff_s=3), s)
+    llm = RecordingLLM(replace(s, llm_retries=4), backoff_s=3)
+    gen = Assistant(Precomputed(hits), llm, s)
 
     def generate(it):
         a = gen.answer(it["question"])
         return {**it, "route": a.route, "answer": a.answer, "sources": a.sources, "model": a.model,
                 "blocked_by": a.blocked_by, "grounding_support": a.grounding_support,
+                "llm_text": llm.raw.get(it["question"]),
                 "passage_text": [h.payload["text"][:1500] for h in hits[it["question"]]]}
 
     with ThreadPoolExecutor(args.workers) as pool:
@@ -294,11 +314,13 @@ def main():
         for (it, jm), m in zip(jobs, pool.map(lambda job: judge_one(clients[job[1]], job[0]), jobs)):
             it["judgments"][jm] = m
 
+    # Save the raw items first, so a crash below can never lose paid-for answers.
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out + ".json").write_text(json.dumps({"items": items}, indent=2), encoding="utf-8")
     report = summarise(items, judges)
     report["grounding_calibration"] = grounding_calibration(items, judges)
     md = to_markdown(report, items, judges)
     print(md)
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out + ".json").write_text(json.dumps({"report": report, "items": items}, indent=2), encoding="utf-8")
     Path(args.out + ".md").write_text(md, encoding="utf-8")
     if os.getenv("GITHUB_STEP_SUMMARY"):
