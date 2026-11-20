@@ -8,6 +8,7 @@ import itertools
 import json
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -18,11 +19,12 @@ from pydantic import BaseModel, Field, field_validator
 from app.answer import Assistant
 from app.cache import AnswerCache, RateLimiter, make_store
 from app.config import Settings, settings
+from app.logs import request_id, setup_logging
 from app.retrieval import Overloaded
 from app.metrics import RATE_LIMITED, REQUEST_LATENCY, REQUESTS
 from app.safety import redact
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+setup_logging()
 log = logging.getLogger("api")
 
 
@@ -68,6 +70,18 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
     app.state.cache = AnswerCache(app.state.store, s.cache_ttl_s)
     app.state.limiter = RateLimiter(app.state.store, s.rate_limit_per_min)
 
+    @app.middleware("http")
+    async def add_request_id(request: Request, call_next):
+        # Reuse the caller's id (e.g. from the API gateway) so one id spans every hop.
+        rid = request.headers.get("x-request-id") or uuid.uuid4().hex
+        token = request_id.set(rid)
+        try:
+            response = await call_next(request)
+        finally:
+            request_id.reset(token)
+        response.headers["X-Request-ID"] = rid
+        return response
+
     def busy() -> HTTPException:
         # Fail fast instead of queueing forever; clients/load balancer retry another pod.
         return HTTPException(503, "Server busy, please retry.", headers={"Retry-After": "1"})
@@ -88,7 +102,9 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
         REQUESTS.labels(result["route"]).inc()
         elapsed = time.perf_counter() - start
         REQUEST_LATENCY.observe(elapsed)
-        log.info("ask route=%s cached=%s ms=%.0f q=%r", result["route"], cached, elapsed * 1000, question)
+        # Only the redacted question is ever logged.
+        log.info("ask", extra={"fields": {"route": result["route"], "cached": cached,
+                                          "ms": round(elapsed * 1000), "question": question}})
 
     @app.post("/ask")
     def ask(body: AskRequest, request: Request):
@@ -102,7 +118,7 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
         except Overloaded:
             raise busy()
         finish(result, cache_q, question, start, cached=bool(cached))
-        return {**result, "cached": bool(cached)}
+        return {**result, "cached": bool(cached), "request_id": request_id.get()}
 
     @app.post("/ask/stream")
     def ask_stream(body: AskRequest, request: Request):

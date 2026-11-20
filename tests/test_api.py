@@ -97,3 +97,22 @@ def test_overloaded_pod_returns_fast_503_with_retry_after():
     for path in ("/ask", "/ask/stream"):
         r = c.post(path, json={"question": "What is glaucoma?"})
         assert r.status_code == 503 and r.headers["retry-after"] == "1"
+
+
+def test_request_id_is_returned_and_reused():
+    c, _ = make()
+    r = c.post("/ask", json={"question": "What is glaucoma?"})
+    assert r.headers["x-request-id"] == r.json()["request_id"] and len(r.json()["request_id"]) == 32
+    r = c.post("/ask", json={"question": "What is asthma?"}, headers={"X-Request-ID": "gateway-123"})
+    assert r.headers["x-request-id"] == "gateway-123" and r.json()["request_id"] == "gateway-123"
+
+
+def test_logs_are_json_with_request_id():
+    import logging
+    from app.logs import JsonFormatter, request_id
+    token = request_id.set("abc")
+    rec = logging.LogRecord("api", logging.INFO, __file__, 1, "ask", None, None)
+    rec.fields = {"route": "answered"}
+    line = json.loads(JsonFormatter().format(rec))
+    request_id.reset(token)
+    assert line["request_id"] == "abc" and line["route"] == "answered" and line["msg"] == "ask"
