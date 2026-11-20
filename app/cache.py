@@ -35,6 +35,17 @@ class MemoryStore:
     def delete(self, key):
         self.data.pop(key, None), self.expiry.pop(key, None)
 
+    def rpush(self, key, value):
+        self.data.setdefault(key, []).append(value)
+
+    def ltrim(self, key, start, end):
+        items = self.data.get(key, [])
+        self.data[key] = items[start:] if end == -1 else items[start:end + 1]
+
+    def lrange(self, key, start, end):
+        items = self.data.get(key, [])
+        return items[start:] if end == -1 else items[start:end + 1]
+
     def incr(self, key):
         self.data[key] = int(self.get(key) or 0) + 1
         return self.data[key]

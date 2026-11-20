@@ -11,17 +11,20 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
+from typing import Literal
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field, field_validator
 
+from app import feedback
 from app.answer import Assistant
 from app.cache import AnswerCache, RateLimiter, make_store
 from app.config import Settings, settings
 from app.logs import request_id, setup_logging
 from app.retrieval import Overloaded
-from app.metrics import RATE_LIMITED, REQUEST_LATENCY, REQUESTS
+from app.metrics import FEEDBACK, RATE_LIMITED, REQUEST_LATENCY, REQUESTS
 from app.safety import redact
 
 setup_logging()
@@ -44,6 +47,12 @@ class AskRequest(BaseModel):
         if unknown:
             raise ValueError(f"unknown sources {sorted(unknown)}; choose from {sorted(SOURCES)}")
         return v
+
+
+class FeedbackRequest(BaseModel):
+    request_id: str = Field(min_length=1, max_length=64)
+    rating: Literal["up", "down"]
+    comment: str | None = Field(default=None, max_length=500)
 
 
 def create_app(assistant: Assistant | None = None, store=None, s: Settings = settings) -> FastAPI:
@@ -97,9 +106,13 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
         # Filters are part of the cache key: same question + different filter = different answer.
         return question, f"{question}|{sorted(body.sources or [])}|{sorted(body.qtypes or [])}"
 
-    def finish(result: dict, cache_q: str, question: str, start: float, cached: bool):
+    def finish(result: dict, cache_q: str, question: str, start: float, cached: bool, rid: str):
         if not cached and result["route"] != "degraded":  # don't cache outages; retry the LLM next time
             app.state.cache.set(cache_q, result)
+        srcs = result.get("sources") or []
+        feedback.save_trace(app.state.store, rid, {
+            "question": question, "cache_q": cache_q, "route": result["route"], "model": result.get("model"),
+            "top_score": srcs[0]["score"] if srcs else None, "source_ids": [x["id"] for x in srcs]})
         REQUESTS.labels(result["route"]).inc()
         elapsed = time.perf_counter() - start
         REQUEST_LATENCY.observe(elapsed)
@@ -118,8 +131,9 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
             result = cached or app.state.assistant.answer(question, sources=body.sources, qtypes=body.qtypes).to_dict()
         except Overloaded:
             raise busy()
-        finish(result, cache_q, question, start, cached=bool(cached))
-        return {**result, "cached": bool(cached), "request_id": request_id.get()}
+        rid = request_id.get()
+        finish(result, cache_q, question, start, bool(cached), rid)
+        return {**result, "cached": bool(cached), "request_id": rid}
 
     @app.post("/ask/stream")
     def ask_stream(body: AskRequest, request: Request):
@@ -138,18 +152,45 @@ def create_app(assistant: Assistant | None = None, store=None, s: Settings = set
             except Overloaded:
                 raise busy()
 
+        rid = request_id.get()  # read now: the generator runs after this function returns
+
         def events():
             if cached:
                 final = {"type": "done", **cached}
-                yield f"data: {json.dumps({**final, 'cached': True})}\n\n"
+                yield f"data: {json.dumps({**final, 'cached': True, 'request_id': rid})}\n\n"
             else:
                 for event in itertools.chain([first], stream):
                     if event["type"] == "done":
                         final = event
+                        event = {**event, "request_id": rid}
                     yield f"data: {json.dumps(event)}\n\n"
-            finish({k: v for k, v in final.items() if k not in ("type", "cached")}, cache_q, question, start, bool(cached))
+            finish({k: v for k, v in final.items() if k not in ("type", "cached")}, cache_q, question, start, bool(cached), rid)
 
         return StreamingResponse(events(), media_type="text/event-stream")
+
+    @app.post("/feedback")
+    def give_feedback(body: FeedbackRequest):
+        """Thumbs up/down on an answer, by the request_id the answer returned.
+        A thumbs-down evicts that answer from the cache right away."""
+        store = app.state.store
+        try:
+            trace = feedback.load_trace(store, body.request_id)
+            if trace is None:
+                raise HTTPException(404, "unknown or expired request_id")
+            rec = {**trace, "request_id": body.request_id, "rating": body.rating,
+                   "comment": redact(body.comment) if body.comment else None, "ts": int(time.time())}
+            if not feedback.record(store, body.request_id, rec):
+                raise HTTPException(409, "already rated")
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.warning("feedback store unavailable: %s", e)
+            raise HTTPException(503, "feedback unavailable, please retry")
+        evicted = body.rating == "down" and trace["route"] == "answered"
+        if evicted:
+            app.state.cache.delete(trace["cache_q"])
+        FEEDBACK.labels(body.rating).inc()
+        return {"status": "recorded", "cache_evicted": evicted}
 
     @app.get("/healthz")
     def healthz():

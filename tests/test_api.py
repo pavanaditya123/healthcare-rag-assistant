@@ -116,3 +116,23 @@ def test_logs_are_json_with_request_id():
     line = json.loads(JsonFormatter().format(rec))
     request_id.reset(token)
     assert line["request_id"] == "abc" and line["route"] == "answered" and line["msg"] == "ask"
+
+
+def test_thumbs_down_evicts_cached_answer_and_is_logged_once():
+    c, retriever = make()
+    rid = c.post("/ask", json={"question": "What is glaucoma?"}).json()["request_id"]
+    r = c.post("/feedback", json={"request_id": rid, "rating": "down", "comment": "call me at 555-123-4567"})
+    assert r.json() == {"status": "recorded", "cache_evicted": True}
+    assert c.post("/feedback", json={"request_id": rid, "rating": "up"}).status_code == 409
+    assert c.post("/feedback", json={"request_id": "nope", "rating": "up"}).status_code == 404
+    again = c.post("/ask", json={"question": "What is glaucoma?"}).json()
+    assert again["cached"] is False and len(retriever.queries) == 2   # regenerated, not the bad answer
+    from app import feedback
+    (rec,) = feedback.load_log(c.app.state.store)
+    assert rec["rating"] == "down" and rec["top_score"] == 5.0 and "555" not in rec["comment"]
+
+
+def test_stream_done_event_carries_request_id_for_feedback():
+    c, _ = make()
+    done = stream_events(c, "What is glaucoma?")[-1]
+    assert c.post("/feedback", json={"request_id": done["request_id"], "rating": "up"}).status_code == 200
