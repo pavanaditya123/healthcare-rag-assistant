@@ -28,9 +28,12 @@ jobs:
       - name: Retrieval + safety end-to-end (+ real Groq answers if the secret is set)
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: python -m evals.retrieval_eval --sample 1000 --min-medquad-recall 0.90
+        # Groq answer check only on manual runs; pushes run retrieval only (no tokens).
+        run: python -m evals.retrieval_eval --sample 1000 --min-medquad-recall 0.90 --answer-sample ${{ github.event_name == 'workflow_dispatch' && 30 || 0 }}
       - name: Answer quality, LLM-as-judge (two judges, RAGAS-style metrics)
-        if: env.GROQ_API_KEY != ''   # skipped until the repo secret is set
+        # ~0.5M Groq tokens per run, so manual only (Actions -> eval -> Run workflow),
+        # not on every push. Skipped when the secret isn't set.
+        if: github.event_name == 'workflow_dispatch' && env.GROQ_API_KEY != ''
         run: python -m evals.judge_eval --medquad 30 --liveqa 20
       - uses: actions/upload-artifact@v4
         with:
