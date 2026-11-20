@@ -9,7 +9,7 @@ on:
     inputs:
       judges:
         description: "Two judge models, comma separated ('gemini:<model>' uses GEMINI_API_KEY)"
-        default: "qwen/qwen3.8-27b,gemini:gemini-3.8-flash"
+        default: "qwen/qwen3.8-27b,gemini:gemini-3.5-flash-lite"
 
 env:
   GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

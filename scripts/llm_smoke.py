@@ -86,7 +86,7 @@ def main():
             report(f"{role}: {model}", False, describe(e))
 
     # 3. judges, real prompt, must return parseable JSON with all metrics
-    for spec in pick_judges(os.getenv("JUDGES") or "qwen/qwen3.8-27b,gemini:gemini-3.8-flash"):
+    for spec in pick_judges(os.getenv("JUDGES") or "qwen/qwen3.8-27b,gemini:gemini-3.5-flash-lite"):
         prompt = JUDGE_PROMPT.format(question="How is glaucoma treated?", passages=f"[1] Glaucoma: {PASSAGE}",
                                      reference=PASSAGE, answer="Glaucoma is treated with eye drops, laser or surgery. [1]")
         t0 = time.perf_counter()

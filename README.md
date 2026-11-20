@@ -498,7 +498,7 @@ flowchart LR
     QS["50 questions<br/>30 MedQuAD + 20 LiveQA<br/>with NIH reference answers"] --> R["retrieve<br/>sequential, CPU"]
     R --> G["generate<br/>ThreadPoolExecutor"]
     G --> J1["Judge A<br/>qwen/qwen3.8-27b (Groq)"]
-    G --> J2["Judge B<br/>gemini-3.8-flash (Google)"]
+    G --> J2["Judge B<br/>gemini-3.5-flash-lite (Google)"]
     J1 --> M["per-answer JSON:<br/>claims + support, relevance,<br/>passage relevance, reference facts"]
     J2 --> M
     M --> CF{"error flagged by"}

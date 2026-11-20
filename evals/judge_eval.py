@@ -78,7 +78,7 @@ def judge_client(spec: str, s: Settings) -> GroqLLM:
                  llm_max_tokens=4000, llm_timeout_s=120, llm_retries=4)
     extra = {"response_format": {"type": "json_object"}}
     if provider == "gemini":
-        extra["reasoning_effort"] = "low"  # default thinking took ~88 s per judgment in the smoke test
+        extra["reasoning_effort"] = "low"  # gemini-3.8-flash took ~80 s per judgment and ran out of free quota; flash-lite: <1 s
     return GroqLLM(js, backoff_s=4, extra_body=extra)
 
 
@@ -266,7 +266,7 @@ def main():
     ap.add_argument("--index-path", default="data/eval_index")
     ap.add_argument("--medquad", type=int, default=30)
     ap.add_argument("--liveqa", type=int, default=20)
-    ap.add_argument("--judges", default="qwen/qwen3.8-27b,gemini:gemini-3.8-flash",
+    ap.add_argument("--judges", default="qwen/qwen3.8-27b,gemini:gemini-3.5-flash-lite",
                     help="two judges, comma separated; 'gemini:<model>' uses GEMINI_API_KEY. "
                          "Pick families different from the Llama generator.")
     ap.add_argument("--workers", type=int, default=2,
