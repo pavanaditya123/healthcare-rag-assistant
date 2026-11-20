@@ -65,3 +65,15 @@ def test_stream_parses_sse_and_falls_back_before_first_token():
 
     out = list(client(handler).stream([]))
     assert "".join(t for t, _ in out) == "Hello [1]" and out[0][1] == "small"
+
+
+def test_describe_handles_every_error_shape():
+    import httpx
+    from app.llm import describe
+    req = httpx.Request("POST", "https://x")
+    for body, want in [({"error": {"message": "model gone"}}, "model gone"),
+                       ([{"error": {"code": 404, "message": "not found"}}], "not found"),
+                       ("plain text", "plain text")]:
+        resp = httpx.Response(404, json=body, request=req) if not isinstance(body, str) else httpx.Response(404, text=body, request=req)
+        e = httpx.HTTPStatusError("x", request=req, response=resp)
+        assert describe(e) == f"HTTP 404: {want}"

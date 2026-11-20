@@ -64,10 +64,9 @@ def main():
         except Exception as e:  # noqa: BLE001
             ok = False
             print(f"[FAIL] {provider:6} {model:28} ({in_list}) {describe(e)}")
-    for provider, ids in listed.items():
-        hint = sorted(i for i in ids if ("llama" in i or "gpt-oss" in i) if provider == "groq") or \
-               sorted(i for i in ids if "flash" in i)[:8]
-        print(f"{provider} models you can use instead: {', '.join(hint[:10])}")
+    for provider, ids in sorted(listed.items()):
+        usable = sorted(ids) if provider == "groq" else sorted(i for i in ids if "flash" in i or "pro" in i)
+        print(f"{provider} models available to this key: {', '.join(usable[:25])}")
     sys.exit(0 if ok else 1)
 
 

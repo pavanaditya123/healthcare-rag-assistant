@@ -25,7 +25,10 @@ def describe(e: Exception) -> str:
     the HTTP status and the provider's error message, never request headers."""
     if isinstance(e, httpx.HTTPStatusError):
         try:
-            msg = e.response.json().get("error", {}).get("message", "")
+            body = e.response.json()
+            body = body[0] if isinstance(body, list) and body else body  # Gemini wraps errors in a list
+            err = body.get("error", body) if isinstance(body, dict) else body
+            msg = err.get("message", err) if isinstance(err, dict) else err
         except ValueError:
             msg = e.response.text
         return f"HTTP {e.response.status_code}: {str(msg)[:200]}"
