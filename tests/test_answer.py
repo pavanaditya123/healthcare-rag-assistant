@@ -57,3 +57,4 @@ def test_context_cache_skips_retrieval_but_still_calls_llm():
     first, second = a.answer("What is glaucoma?"), a.answer("what is GLAUCOMA?")
     assert len(retriever.queries) == 1 and llm.calls == 2   # retrieval cached, LLM not
     assert first.sources == second.sources and second.route == "answered"
+    assert first.context_cached is False and second.context_cached is True

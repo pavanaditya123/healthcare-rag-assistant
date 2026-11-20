@@ -32,6 +32,7 @@ class Answer:
     answer: str
     sources: list[dict] = field(default_factory=list)
     model: str | None = None
+    context_cached: bool = False  # passages came from the context cache (retrieval skipped)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -81,14 +82,14 @@ class Assistant:
         self.retriever, self.llm, self.s = retriever, llm, settings
         self.context_cache = context_cache  # optional AnswerCache(layer="context")
 
-    def retrieve(self, question, sources, qtypes) -> list[Hit]:
+    def retrieve(self, question, sources, qtypes) -> tuple[list[Hit], bool]:
         """Top-k reranked hits, from the context cache when possible.
         Cached BEFORE the score threshold, so tuning MIN_RERANK_SCORE needs no flush."""
         key = f"{question}|{sorted(sources or [])}|{sorted(qtypes or [])}"
         if self.context_cache:
             cached = self.context_cache.get(key)
             if cached is not None:
-                return [Hit(h["id"], h["score"], h["payload"]) for h in cached]
+                return [Hit(h["id"], h["score"], h["payload"]) for h in cached], True
         hits = self.retriever.search(question, sources=sources, qtypes=qtypes).reranked[: self.s.top_k]
         if self.context_cache:
             # Store only the text the prompt uses, to keep Redis small.
@@ -96,22 +97,23 @@ class Assistant:
                 {"id": h.id, "score": h.score,
                  "payload": {**h.payload, "text": h.payload["text"][:MAX_SOURCE_CHARS]}}
                 for h in hits])
-        return hits
+        return hits, False
 
     def _route_and_retrieve(self, question, sources, qtypes):
         """Shared by answer() and stream(): returns (final Answer, None) when we
-        must not call the LLM, else (None, top hits)."""
+        must not call the LLM, else (None, top hits). Also returns whether the
+        passages came from the context cache."""
         route = safety.classify(question)
         if route == safety.EMERGENCY:
-            return Answer(route, safety.EMERGENCY_MESSAGE), None
+            return Answer(route, safety.EMERGENCY_MESSAGE), None, False
         if route == safety.DIAGNOSIS_DOSE:
-            return Answer(route, safety.DIAGNOSIS_DOSE_MESSAGE), None
+            return Answer(route, safety.DIAGNOSIS_DOSE_MESSAGE), None, False
         if route == safety.OUT_OF_SCOPE:
-            return Answer(route, safety.OUT_OF_SCOPE_MESSAGE), None
-        hits = self.retrieve(question, sources, qtypes)
+            return Answer(route, safety.OUT_OF_SCOPE_MESSAGE), None, False
+        hits, ctx = self.retrieve(question, sources, qtypes)
         if not hits or hits[0].score < self.s.min_rerank_score:
-            return Answer("no_info", safety.NO_INFO_MESSAGE), None
-        return None, hits
+            return Answer("no_info", safety.NO_INFO_MESSAGE, context_cached=ctx), None, ctx
+        return None, hits, ctx
 
     def stream(self, question: str, sources=None, qtypes=None):
         """Yield events for /ask/stream:
@@ -121,12 +123,12 @@ class Assistant:
                                     validation, "done" carries the sources-only answer
                                     and the client must replace what it displayed.
         """
-        early, hits = self._route_and_retrieve(question, sources, qtypes)
+        early, hits, ctx = self._route_and_retrieve(question, sources, qtypes)
         if early:
             yield {"type": "done", **early.to_dict()}
             return
         srcs = format_sources(hits)
-        yield {"type": "sources", "sources": srcs}
+        yield {"type": "sources", "sources": srcs, "context_cached": ctx}
         text, model = "", None
         try:
             for delta, model in self.llm.stream(build_messages(question, hits)):
@@ -134,18 +136,18 @@ class Assistant:
                 yield {"type": "token", "text": delta}
         except LLMError:
             DEGRADED.labels("llm_unavailable").inc()
-            yield {"type": "done", **Answer("degraded", sources_only(hits), srcs, model).to_dict()}
+            yield {"type": "done", **Answer("degraded", sources_only(hits), srcs, model, ctx).to_dict()}
             return
         if not citations_valid(text, len(hits)):
             DEGRADED.labels("invalid_citations").inc()
-            yield {"type": "done", **Answer("degraded", sources_only(hits), srcs, model).to_dict()}
+            yield {"type": "done", **Answer("degraded", sources_only(hits), srcs, model, ctx).to_dict()}
             return
-        yield {"type": "done", **Answer("answered", text.strip(), srcs, model).to_dict()}
+        yield {"type": "done", **Answer("answered", text.strip(), srcs, model, ctx).to_dict()}
 
     def answer(self, question: str, sources: list[str] | None = None, qtypes: list[str] | None = None) -> Answer:
         """`question` must already be PHI-redacted (see main.py).
         `sources` / `qtypes` are optional metadata filters (see retrieval.search)."""
-        early, hits = self._route_and_retrieve(question, sources, qtypes)
+        early, hits, ctx = self._route_and_retrieve(question, sources, qtypes)
         if early:
             return early
         sources = format_sources(hits)
@@ -154,8 +156,8 @@ class Assistant:
             text, model = self.llm.complete(build_messages(question, hits))
         except LLMError:
             DEGRADED.labels("llm_unavailable").inc()
-            return Answer("degraded", sources_only(hits), sources)
+            return Answer("degraded", sources_only(hits), sources, context_cached=ctx)
         if not citations_valid(text, len(hits)):
             DEGRADED.labels("invalid_citations").inc()
-            return Answer("degraded", sources_only(hits), sources, model)
-        return Answer("answered", text, sources, model)
+            return Answer("degraded", sources_only(hits), sources, model, ctx)
+        return Answer("answered", text, sources, model, ctx)

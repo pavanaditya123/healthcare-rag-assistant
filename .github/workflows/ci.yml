@@ -59,6 +59,8 @@ jobs:
           nohup uvicorn app.main:app --port 8000 --workers 2 > api.log 2>&1 &
           for i in $(seq 60); do curl -sf localhost:8000/readyz && exit 0; sleep 2; done
           cat api.log; exit 1
+      - name: End-to-end feature check (real models, Qdrant, Redis; 2 workers share state)
+        run: python scripts/e2e_check.py --url http://localhost:8000
       - name: Load test - normal load (2 concurrent users = 1 per core)
         # Capacity of this 2-vCPU box is ~1 search in flight per core; more than
         # that is the overload phase below. p95 must stay under 3 s with no shedding.
