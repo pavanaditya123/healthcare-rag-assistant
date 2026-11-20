@@ -1,301 +1,300 @@
 # Healthcare RAG Assistant
 
-**Ask a health question in plain English. Get a short answer written only from
-official NIH pages, with a link to every source, and no guessing.**
+A production-style **Retrieval-Augmented Generation (RAG)** service that answers
+consumer health questions **only from official NIH content (MedQuAD)**, cites every
+claim, routes emergencies to helplines without calling the LLM, refuses diagnosis
+and dosing questions, and degrades to a sources-only answer when the LLM fails.
+Every quality claim is backed by an eval that runs in GitHub Actions.
 
 ```text
-You:        How is cystic fibrosis treated?
-Assistant:  Treatment focuses on clearing mucus from the lungs, preventing infections
-            and getting enough nutrition ... [1][2]
-            [1] Cystic fibrosis - Genetics Home Reference (ghr.nlm.nih.gov/...)
-            [2] Cystic Fibrosis - NHLBI (nhlbi.nih.gov/...)
+POST /ask  {"question": "How is cystic fibrosis treated?"}
+
+{"route": "answered",
+ "answer": "Treatment focuses on clearing mucus from the lungs, preventing infections
+            and getting enough nutrition ... [1][2]",
+ "sources": [{"n": 1, "title": "cystic fibrosis", "url": "https://ghr.nlm.nih.gov/..."},
+             {"n": 2, "title": "Cystic Fibrosis", "url": "https://www.nhlbi.nih.gov/..."}],
+ "cached": false, "request_id": "9f2c..."}
 ```
 
-It also knows when **not** to answer:
+| Input | Route | Behaviour |
+|---|---|---|
+| "My dad has crushing chest pain right now" | `emergency` | Fixed message with 911 / 988 / Poison Control. LLM never called |
+| "How many mg of ibuprofen should I take?" | `diagnosis_dose` | Refusal; refers to a clinician or pharmacist. LLM never called |
+| "How do I fix my car brakes?" | `out_of_scope` | Refusal: health topics only |
+| Health question with no good match in the corpus | `no_info` | "I couldn't find reliable information", instead of letting the LLM improvise |
+| LLM down, or invalid citations | `degraded` | Top NIH passages, cited, without generated text |
 
-| You ask | It does |
-|---|---|
-| "My dad has crushing chest pain right now" | Shows emergency numbers (911, 988, Poison Control). The AI never sees the question |
-| "How many mg of ibuprofen should I take?" | Politely refuses: dosing is for a doctor or pharmacist |
-| "How do I fix my car brakes?" | Says it only covers health topics |
-| A health question NIH pages don't cover | Says "I couldn't find reliable information" instead of making something up |
+> Not medical advice. Portfolio project; answers are general NIH information, not a substitute for a clinician.
 
-> Not medical advice. This is a portfolio project. Answers are general information
-> from NIH pages, not a substitute for a clinician.
+**In everyday terms:** imagine asking a librarian at the National Institutes of
+Health a question. They don't answer from memory: they find the right pages, write
+you a short note quoting them, and staple the page references to it. If you describe
+an emergency, they don't look anything up; they hand you the emergency number
+immediately.
 
 ---
 
 ## Contents
 
-1. [How it works, in two minutes](#how-it-works-in-two-minutes)
-2. [The big picture](#the-big-picture)
-3. [Life of one question, step by step](#life-of-one-question-step-by-step)
-4. [Safety: when it refuses to answer](#safety-when-it-refuses-to-answer)
-5. [Finding the right passages (retrieval)](#finding-the-right-passages-retrieval)
+1. [Architecture at a glance](#architecture-at-a-glance)
+2. [Request lifecycle](#request-lifecycle)
+3. [Safety layer](#safety-layer)
+4. [Hybrid retrieval and reranking](#hybrid-retrieval-and-reranking)
+5. [Generation and citation validation](#generation-and-citation-validation)
 6. [Results](#results)
-7. [How quality is checked](#how-quality-is-checked)
-8. [Making answers fast](#making-answers-fast)
-9. [Learning from users (feedback)](#learning-from-users-feedback)
-10. [Staying up under heavy load](#staying-up-under-heavy-load)
-11. [How it runs in production](#how-it-runs-in-production)
-12. [Run it yourself](#run-it-yourself)
-13. [API](#api)
-14. [What it does not do yet](#what-it-does-not-do-yet)
-15. [Project layout and configuration](#project-layout-and-configuration)
+7. [Evaluation strategy](#evaluation-strategy)
+8. [Latency: caching and streaming](#latency-caching-and-streaming)
+9. [Human feedback loop](#human-feedback-loop)
+10. [Reliability under load](#reliability-under-load)
+11. [Deployment architecture](#deployment-architecture)
+12. [Observability](#observability)
+13. [Run it](#run-it)
+14. [API reference](#api-reference)
+15. [Known limitations](#known-limitations)
+16. [Project layout and configuration](#project-layout-and-configuration)
+17. [Glossary](#glossary)
 
 ---
 
-## How it works, in two minutes
-
-### The problem
-
-A chatbot like ChatGPT answers from what it remembers from training. That memory
-can be out of date or simply wrong, and the chatbot can state made-up facts very
-confidently (this is called **hallucination**). For health questions, a confident
-wrong answer can hurt someone.
-
-### The idea: a small team with strict rules
-
-Picture a help desk at a medical library, staffed by four people:
-
-```mermaid
-flowchart LR
-    U["Visitor asks<br/>a question"] --> R["Receptionist<br/>sends emergencies to 911,<br/>turns away off-topic questions"]
-    R --> L["Librarian<br/>finds the 5 most useful<br/>pages in the NIH library"]
-    L --> W["Writer<br/>writes a short answer<br/>using ONLY those 5 pages"]
-    W --> E["Editor<br/>checks every sentence<br/>points to a real page"]
-    E --> U2["Visitor gets the answer<br/>plus links to check it"]
-```
-
-| Person at the desk | In this project | What it does |
-|---|---|---|
-| Receptionist | Safety router (`app/safety.py`) | Simple written rules. Emergencies get helpline numbers immediately; dosing and diagnosis questions are politely refused |
-| Librarian | Search (`app/retrieval.py`) | Searches 16,407 passages from official NIH health websites |
-| Writer | AI model (Llama 3.3, run by Groq) | Writes the answer, but may only use what the librarian found |
-| Editor | Citation checker (`app/answer.py`) | Rejects the answer if a sentence doesn't point to a real passage, and shows the original NIH passages instead |
-
-### The name for this: RAG
-
-This design is called **RAG (Retrieval-Augmented Generation)**. It works like an
-open-book exam instead of answering from memory:
-
-1. **Retrieve:** search a trusted library (here, 16,407 passages from NIH websites) for the passages that answer the question.
-2. **Augment:** hand those passages to the AI together with the question.
-3. **Generate:** the AI writes a short answer **using only those passages**, and must say which passage each sentence came from.
-
-```mermaid
-flowchart LR
-    Q["Your question"] --> R["1. Retrieve<br/>search NIH library"]
-    R --> A["2. Augment<br/>question + top 5 passages"]
-    A --> G["3. Generate<br/>AI writes answer<br/>with citations [1] [2]"]
-    G --> Ans["Answer you can check"]
-```
-
-### Words used below
-
-| Word | Plain meaning |
-|---|---|
-| **API** | The "front door" other programs use to talk to this service: send a question, get an answer back as data |
-| **Server / pod** | A computer program (here, the API) running and waiting for questions. A *pod* is one copy of it in Kubernetes |
-| **AI model / LLM** | Large Language Model: the program that writes text. This project uses Llama 3.3 70B, run on Groq's computers |
-| **Token** | A piece of a word (roughly 4 letters). AI providers count usage, cost and limits in tokens |
-| **Chunk / passage** | One small piece of the library. Here, one answer section of an NIH page, e.g. "How is asthma treated?" |
-| **Embedding** | A list of numbers that captures what a text *means*. Texts with similar meaning get similar numbers |
-| **BM25 (sparse search)** | Classic keyword search, like a search engine from the 2000s. Great at exact words, bad at synonyms |
-| **Dense search** | Search by meaning using embeddings. Finds "heart attack" when the page says "myocardial infarction" |
-| **Vector database (Qdrant)** | A database built to find the closest embeddings fast |
-| **RRF (Reciprocal Rank Fusion)** | A simple way to merge two ranked lists: items near the top of *either* list rise to the top |
-| **Reranker (cross-encoder)** | A slower, more careful model that reads the question and each passage *together* and scores how well they match |
-| **Citation `[1]`** | A pointer from a sentence to the passage it came from |
-| **PHI** | Protected Health Information: names, phone numbers, emails, dates and other details that identify a person |
-| **Cache** | Remembering a recent result so the same question is answered instantly next time |
-| **Redis** | A very fast memory store. Here it holds the caches, the rate-limit counters and user votes |
-| **Threshold** | A cut-off score. Below it, the match is too weak and the service says "I couldn't find reliable information" |
-| **Latency** | How long one answer takes. **p50** = the typical request; **p95** = 95% of requests are faster than this, so it measures the slow ones |
-| **CPU / core** | The computer's processor. The search models run on it, and each core does one heavy job at a time |
-| **Docker** | Packs the app and everything it needs into one box (an *image*) that runs the same on any computer |
-| **Kubernetes** | Runs many copies of that box across machines, restarts broken ones, and adds copies when traffic grows |
-| **CI (GitHub Actions)** | Robots that run all the tests automatically every time the code changes, and block changes that break something |
-| **HTTP 503** | The standard web reply for "busy right now, try again shortly" || **recall@5** | Out of 100 questions, how often the correct passage is in the top 5 results |
-
----
-
-## The big picture
+## Architecture at a glance
 
 ```mermaid
 flowchart TD
-    U["User question"] --> PHI["1. Remove personal details<br/>phone, email, name ..."]
-    PHI --> SR{"2. Safety router<br/>simple, readable rules"}
-    SR -- "emergency" --> EM["Emergency numbers<br/>911 / 988 / Poison Control"]
-    SR -- "diagnosis or dosing" --> REF["Polite refusal:<br/>ask a doctor"]
-    SR -- "not about health" --> OOS["Only health topics"]
-    SR -- "normal health question" --> AC{"3. Seen this<br/>question recently?"}
-    AC -- "yes" --> FAST["Return saved answer<br/>~2 ms"]
-    AC -- "no" --> RET["4. Search NIH library<br/>keyword + meaning + rerank"]
-    RET --> TH{"5. Good enough<br/>match?"}
-    TH -- "no" --> NOI["'I couldn't find reliable<br/>information'"]
-    TH -- "yes" --> LLM["6. AI writes answer<br/>from top 5 passages only"]
-    LLM --> CV{"7. Every paragraph<br/>cites a real source?"}
-    CV -- "yes" --> OK["Answer + sources"]
-    CV -- "no, or AI is down" --> SO["Safe fallback:<br/>show the NIH passages"]
+    Q["POST /ask"] --> RL{"Rate limiter<br/>Redis INCR, 30/min/client"}
+    RL -- "over limit" --> R429["429 Too Many Requests"]
+    RL --> PHI["PHI redaction<br/>regex: name, phone, email, SSN, date, MRN, address"]
+    PHI --> SR{"Safety router<br/>rule-based classifier"}
+    SR -- "emergency" --> EM["Fixed helpline response<br/>no LLM call"]
+    SR -- "diagnosis_dose" --> DD["Fixed refusal<br/>no LLM call"]
+    SR -- "out_of_scope" --> OS["Fixed refusal<br/>no LLM call"]
+    SR -- "normal" --> AC{"Answer cache<br/>Redis, TTL 1 h"}
+    AC -- "hit" --> HIT["Cached answer, ~2 ms"]
+    AC -- "miss" --> CC{"Context cache<br/>Redis, TTL 24 h"}
+    CC -- "hit" --> TH
+    CC -- "miss" --> HR["Hybrid retrieval<br/>BM25 + dense bge-small in Qdrant<br/>RRF fusion"]
+    HR --> CE["Cross-encoder rerank<br/>ms-marco-MiniLM-L-6-v2, ONNX on CPU"]
+    CE --> TH{"Top score >= MIN_RERANK_SCORE?"}
+    TH -- "no" --> NI["no_info response"]
+    TH -- "yes" --> LLM["LLM generation<br/>Groq Llama 3.3 70B, top-5 passages"]
+    LLM --> CV{"Citation validator<br/>every [n] valid, every paragraph cited"}
+    CV -- "pass" --> OK["answered + sources"]
+    CV -- "fail / LLMError" --> DG["degraded: sources-only answer"]
 
-    style EM fill:#fde2e2,stroke:#c0392b
-    style REF fill:#fdf0d5,stroke:#b9770e
-    style OOS fill:#fdf0d5,stroke:#b9770e
-    style NOI fill:#fdf0d5,stroke:#b9770e
-    style OK fill:#d5f5e3,stroke:#1e8449
-    style FAST fill:#d5f5e3,stroke:#1e8449
-    style SO fill:#eaf2f8,stroke:#2471a3
+    style EM fill:#fde2e2,stroke:#c0392b,color:#000
+    style DD fill:#fdf0d5,stroke:#b9770e,color:#000
+    style OS fill:#fdf0d5,stroke:#b9770e,color:#000
+    style NI fill:#fdf0d5,stroke:#b9770e,color:#000
+    style OK fill:#d5f5e3,stroke:#1e8449,color:#000
+    style HIT fill:#d5f5e3,stroke:#1e8449,color:#000
+    style DG fill:#eaf2f8,stroke:#2471a3,color:#000
 ```
 
-The AI (step 6) is only reached by normal health questions with a good match in
-the NIH library. Emergencies, dosing questions and off-topic questions are
-handled by plain rules before that, so the AI cannot get them wrong.
+**Technically:** a stateless FastAPI service. State lives in Qdrant (vector index)
+and Redis (caches, rate-limit counters, feedback). The LLM is only reached by
+`normal` questions that pass the retrieval-score threshold; every other path is
+deterministic.
+
+**In everyday terms:** think of a hospital information desk with a strict
+procedure. A **guard** stops people who keep coming back every few seconds (rate
+limiter). A **clerk** blacks out your name and phone number on the form before
+anyone else sees it (PHI redaction). A **triage nurse** reads the form first: chest
+pain goes straight to emergency, "what dose should I take?" goes to the pharmacist
+(safety router). Only ordinary questions reach the **librarian** (retrieval), who
+pulls the best pages, and the **writer** (LLM), who drafts a reply from those pages
+only. An **editor** (citation validator) checks every sentence against the pages
+before the reply goes out.
 
 ---
 
-## Life of one question, step by step
+## Request lifecycle
 
-Example: *"I'm Sam, call me on 555-123-4567. How is glaucoma treated?"*
+Example input: *"I'm Sam, call me on 555-123-4567. How is glaucoma treated?"*
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant U as User
-    participant API as API (FastAPI)
-    participant R as Redis (cache)
-    participant Q as Qdrant (NIH library)
-    participant M as Models on CPU
-    participant L as LLM (Groq)
+    participant C as Client
+    participant API as FastAPI
+    participant RD as Redis
+    participant QD as Qdrant
+    participant ONNX as fastembed ONNX (CPU)
+    participant G as Groq LLM
 
-    U->>API: question
-    API->>API: redact PHI -> "I'm [NAME], call me on [PHONE]. How is glaucoma treated?"
-    API->>API: safety router -> normal question
-    API->>R: answer cached?
-    R-->>API: no
-    API->>R: passages cached?
-    R-->>API: no
-    par keyword and meaning search at the same time
-        API->>Q: BM25 search (top 10)
-        API->>Q: dense search (top 10)
+    C->>API: POST /ask
+    API->>RD: rate limit INCR ratelimit:client:minute
+    API->>API: redact() -> "I'm [NAME], call me on [PHONE]. How is glaucoma treated?"
+    API->>API: classify() -> normal
+    API->>RD: GET answer:v1:sha256(question)
+    RD-->>API: miss
+    API->>RD: GET context:v1:sha256(question)
+    RD-->>API: miss
+    par parallel retrieval (ThreadPoolExecutor)
+        API->>ONNX: BM25 query vector
+        API->>QD: sparse search, top 10
+        API->>ONNX: bge-small query embedding
+        API->>QD: dense search, top 10
     end
-    API->>API: RRF merge
-    API->>M: rerank the merged passages
-    M-->>API: best 5 passages with scores
-    API->>R: save passages (24 h)
-    API->>L: question + 5 passages + rules ("cite every paragraph")
-    L-->>API: answer text with [1] [2]
-    API->>API: check citations are real
-    API->>R: save answer (1 h)
-    API-->>U: answer + sources + request_id
+    API->>API: RRF fusion (k = 60)
+    API->>ONNX: cross-encoder rerank (first 1,000 chars per passage)
+    API->>RD: SETEX context (24 h)
+    API->>G: system prompt + question + top-5 passages
+    G-->>API: answer with [1] [2]
+    API->>API: citations_valid()
+    API->>RD: SETEX answer (1 h), trace for feedback (24 h)
+    API-->>C: answer, sources, request_id
 ```
 
-| Step | What happens | Why |
+| Step | Component | Purpose |
 |---|---|---|
-| Redact PHI | Phone numbers, emails, names, dates, IDs and addresses become `[PHONE]`, `[EMAIL]` and so on | Personal details never reach the logs, the cache or the AI provider |
-| Safety router | Rules sort the question: emergency, diagnosis/dosing, off-topic or normal | Dangerous questions get a fixed, safe reply. No AI involved |
-| Answer cache | Same question asked recently? Return the saved answer | ~2 ms instead of ~1 s |
-| Passage cache | Same question's passages found recently? Skip the search | Search is the slow part; only the AI runs again |
-| Hybrid search | Keyword search and meaning search run **in parallel** | Each finds things the other misses |
-| Rerank | A careful model rescores the merged list | The biggest single quality gain (see Results) |
-| Threshold | Best score too low? Say "no reliable information" | Better to admit it than to let the AI improvise |
-| Generate | Llama 3.3 70B writes a ≤150-word answer from the 5 passages only | Short, grounded, cited |
-| Validate | Every `[n]` must point to a real passage, and every paragraph must cite | Catches made-up citations. If it fails, show the passages instead |
+| 1 | `RateLimiter` | Fixed window per client per minute; fails open if Redis is down |
+| 2 | `redact()` | PHI replaced by `[NAME]`, `[PHONE]`, ... before logging, caching or calling the LLM |
+| 3 | `classify()` | Rule-based routing; emergencies never reach retrieval or the LLM |
+| 4–5 | `AnswerCache` (two layers) | Skip everything on an answer hit; skip retrieval on a context hit |
+| 6 | `sparse_search` / `dense_search` | Two independent retrievers, run concurrently |
+| 7 | `rrf()` | Rank-based fusion; no score normalisation needed |
+| 8 | `rerank()` | Cross-encoder rescoring; the largest quality gain |
+| 9 | `GroqLLM.complete()` | Grounded generation with timeout, retry and fallback |
+| 10 | `citations_valid()` | Rejects invented or missing citations, falling back to sources-only |
+
+**In everyday terms:** it's like posting a parcel. The post office weighs it
+(rate limit), removes your personal note from the outside (redaction), checks it
+isn't something dangerous (safety router), checks whether an identical parcel was
+just sent and can be reused (cache), and only then does the real work. You get a
+**tracking number** (`request_id`), so any complaint can be traced to exactly that
+parcel.
 
 ---
 
-## Safety: when it refuses to answer
+## Safety layer
 
 ```mermaid
 flowchart TD
-    Q["Question, after PHI removal"] --> E{"Self-harm words?<br/>or a person + acute symptom<br/>('my dad' + 'chest pain')"}
-    E -- yes --> E1["EMERGENCY<br/>911, 988, Poison Control<br/>AI never called"]
-    E -- no --> D{"Asks for a diagnosis or a dose?<br/>'do I have...', 'how many mg...'"}
-    D -- yes --> D1["REFUSE<br/>see a doctor or pharmacist<br/>AI never called"]
-    D -- no --> O{"Clearly not health?<br/>cars, cooking, coding ..."}
-    O -- yes --> O1["OUT OF SCOPE<br/>AI never called"]
-    O -- no --> N["Normal: continue to search"]
-    N --> T{"Best match score<br/>below threshold?"}
-    T -- yes --> T1["'No reliable information'<br/>catches what the rules missed"]
-    T -- no --> A["Answer with citations"]
+    IN["redacted question"] --> SH{"SELF_HARM patterns<br/>suicid*, want to die, end my life ..."}
+    SH -- match --> EM["route = emergency"]
+    SH -- no --> AC{"ACUTE_NOW<br/>PERSON cue within 60 chars of<br/>chest pain, can't breathe, seizure,<br/>overdose, swallowed bleach ..."}
+    AC -- match --> EM
+    AC -- no --> DD{"DIAGNOSIS_DOSE_RULE<br/>do I have, how many mg,<br/>should I stop taking ..."}
+    DD -- match --> DR["route = diagnosis_dose"]
+    DD -- no --> OOS{"OUT_OF_SCOPE_RULE<br/>cars, cooking, code ..."}
+    OOS -- match --> OR["route = out_of_scope"]
+    OOS -- no --> N["route = normal -> retrieval"]
+    N --> T{"rerank score < MIN_RERANK_SCORE"}
+    T -- yes --> NI["route = no_info<br/>second safety net"]
 ```
-
-**Why rules and not an AI classifier?** For emergencies, a rule you can read and
-test beats a model you have to trust, and it takes ~0 ms. "What are the signs of
-a stroke?" is still answered. Only a *person* plus an *acute symptom* ("my mom
-can't breathe") triggers the emergency reply.
 
 | Risk | Control |
 |---|---|
-| Personal data leaking | Regex redaction runs first; nothing after it (cache key, logs, AI) sees the raw text |
-| Emergencies | Rule-based, checked before anything else; fixed reply with helplines |
-| Diagnosis / dosing | Refused by rule, no AI call |
-| Made-up facts | The AI sees only the top 5 NIH passages, must cite every paragraph, and citations are validated |
-| Questions the library can't answer | Score threshold returns "no reliable information"; also a second net for off-topic questions |
+| PHI leakage to logs, cache or a third-party LLM | Regex redaction first; nothing downstream sees raw text |
+| Missed emergency | Rule-based, evaluated first; CI gate requires **100% emergency recall** |
+| Diagnosis or dosing advice | Rule-based refusal, no LLM call |
+| Hallucination | Top-5 NIH passages only, mandatory citations, citation validator |
+| Unanswerable questions | Retrieval-score threshold returns `no_info` |
 
-The 100-question safety test set is checked on every code change. Emergency
-recall must be 100%, and no emergency or dosing question may ever reach the AI.
+**Why rules instead of an ML classifier?** For emergencies, a readable,
+unit-tested regex beats a model you have to trust, and it adds ~0 ms. "What are the
+signs of a stroke?" is still answered, because acute terms only trigger with a person
+cue ("my mom can't breathe"). The cost is recall on phrasings nobody has written a
+rule for, which is what the safety set exists to grow.
+
+**In everyday terms:** an emergency-room **triage nurse** doesn't let a trainee
+handle "my father has chest pain"; it goes straight to the emergency team, every
+time, by a fixed rule. A **pharmacist** won't tell you your dose over the counter
+without your doctor. And a good librarian who can't find a reliable source says
+"I don't know" instead of guessing. That last one is the `no_info` threshold.
 
 ---
 
-## Finding the right passages (retrieval)
+## Hybrid retrieval and reranking
 
 ```mermaid
 flowchart LR
-    Q["question"] --> S["BM25 keyword search<br/>top 10"]
-    Q --> D["Dense meaning search<br/>bge-small, top 10"]
-    S --> F["RRF merge<br/>score = sum of 1 / (60 + rank)"]
-    D --> F
-    F --> RR["Cross-encoder rerank<br/>reads question + passage together"]
-    RR --> T5["Top 5 passages<br/>to the AI"]
+    Q["query"] --> SP["Sparse: BM25<br/>Qdrant/bm25 + IDF modifier<br/>top 10"]
+    Q --> DN["Dense: bge-small-en-v1.5<br/>384-d, cosine<br/>top 10"]
+    SP --> RRF["RRF fusion<br/>score = sum 1 / (60 + rank)"]
+    DN --> RRF
+    RRF --> CE["Cross-encoder rerank<br/>MiniLM-L-6, query + passage jointly<br/>first 1,000 chars"]
+    CE --> K["top-5 to the LLM"]
+    F["payload filters<br/>source, qtype<br/>applied inside Qdrant"] -.-> SP
+    F -.-> DN
 ```
 
-**Why two searches?** Keyword search finds exact terms such as gene names. Meaning
-search finds paraphrases: people write "sugar in my blood", NIH writes
-"hyperglycemia". RRF merges the two lists using only *ranks*, so their very
-different score scales never need to be compared.
+| Stage | What it is good at | Weakness |
+|---|---|---|
+| **BM25 (sparse)** | Exact terms: gene names, drug names, rare words | No synonyms: "heart attack" ≠ "myocardial infarction" |
+| **Dense (bi-encoder)** | Meaning and paraphrase | Can miss exact rare terms |
+| **RRF fusion** | Combines both using ranks only, so scales never need calibrating | Can't fix an ordering both retrievers got wrong |
+| **Cross-encoder** | Reads query and passage *together*: the most accurate signal | Too slow to run on 16k passages, so it only reorders ~20 candidates |
 
-**Why rerank?** The two searches compare pre-computed numbers, which is fast but
-rough. The reranker reads the question and the passage *together*, like a person
-would. It's too slow to run on all 16,407 passages, so it only reorders the ~20
-the searches found.
+**Metadata filtering:** every point stores `source` (GHR, GARD, NIDDK, ...) and
+`qtype` (causes, treatment, inheritance, ...) with Qdrant payload indexes. Filters
+are **pre-filters** applied inside the search, so a filtered query still returns a
+full candidate list.
 
-**Filters.** Every passage is tagged with its NIH `source` (GHR, GARD, NIDDK, ...)
-and question type (`qtype`: causes, treatment, inheritance, ...). You can ask for
-"only genetics pages" or "only treatment sections". The filter is applied *inside*
-the database before searching, so you still get a full set of results.
+**Chunking:** one chunk per MedQuAD QA section (5,476 pages → 16,407 chunks).
+Sections are already question-sized, and the official relevance judgments are at
+this level, so evaluation maps 1:1 to chunks. The section's question text is
+**never indexed** (only the focus and the answer), which keeps the held-out eval
+honest. Trade-off: about 12% of sections are long, and the models read only the
+first part of those.
 
-**How the library is cut into chunks.** MedQuAD pages are already split into
-question-sized sections ("What causes X?", "How is X treated?"), so **one section
-= one chunk**. The official relevance judgments are at this level too, which keeps
-evaluation exact. Trade-off: about 12% of sections are long, and the models only
-read the first part of those. The section's own question is never indexed, only the
-topic and the answer, so the eval questions are never in the index.
+**In everyday terms:**
+- **BM25** is like using the **index at the back of a textbook**: perfect if you know the exact word, useless if you use a different word.
+- **Dense search** is like asking a **friend who understands what you mean**, even if you describe it badly.
+- **RRF** is like two friends each giving you a top-10 restaurant list; you go first to the places that are high on *both* lists.
+- **The reranker** is like **hiring**: the keyword filter shortlists 20 CVs fast, then you actually *interview* those 20 to pick the best 5. Interviewing all 16,000 applicants would take forever.
+- **Filters** are like asking the librarian for "only the genetics shelf".
+
+---
+
+## Generation and citation validation
+
+```mermaid
+flowchart LR
+    P["top-5 passages<br/>max 1,500 chars each"] --> PR["Prompt<br/>answer ONLY from sources,<br/>cite every paragraph,<br/>no diagnosis, no dosing,<br/>max 150 words"]
+    PR --> G["Groq Llama 3.3 70B<br/>temperature 0, max 300 tokens"]
+    G --> V{"citations_valid()"}
+    V -- "all [n] in 1..5 and<br/>every paragraph cited" --> A["answered"]
+    V -- "invented [7] or<br/>uncited paragraph" --> D["degraded:<br/>sources-only answer"]
+```
+
+**In everyday terms:** it's a **student essay with footnotes**. The student
+(LLM) may only use the five handed-out readings, and must footnote every paragraph.
+The teacher (validator) checks each footnote number exists. A paragraph without a
+footnote, or a footnote pointing to a reading that doesn't exist, means the essay is
+rejected, and you get the original readings instead.
 
 ---
 
 ## Results
 
-Measured on the full library (16,407 chunks from 5,476 NIH pages), real models,
-CPU only. CI re-runs the retrieval eval on every change and **fails if quality drops**.
-
-**In plain words:**
-
-- On NIH-style questions, the right passage is in the top 5 **92–93%** of the time.
-- On messy real-world questions ("I have a 3 year old son with..."), it's **about 45–52%**. That gap is the most important thing to improve next.
-- The reranker is the biggest single gain: **+6 points** on NIH-style questions and **+13** on real questions.
-- **0 of 23** off-topic questions were answered, **25 of 25** emergencies got helplines, and normal questions take **~1.1 s** (p95) under normal load.
+Full corpus (16,407 chunks), real models, CPU only. CI re-runs the retrieval eval
+on code changes and **fails if MedQuAD reranked recall@5 < 0.90**.
 
 ```mermaid
 xychart-beta
-    title "Right passage in top 5 (recall@5), real consumer questions"
-    x-axis ["Keyword (BM25)", "Meaning (dense)", "Merged (RRF)", "+ Rerank"]
+    title "recall@5 by pipeline stage, TREC LiveQA-Med (real consumer questions)"
+    x-axis ["BM25", "Dense", "RRF", "RRF + rerank"]
     y-axis "recall@5" 0 --> 0.6
     bar [0.239, 0.414, 0.393, 0.523]
 ```
 
+| Headline | Value |
+|---|---|
+| MedQuAD held-out recall@5 (n = 1,000), reranked | **0.925** (MRR 0.791) |
+| LiveQA-Med real questions recall@5 (n = 38), reranked | **0.523** at 20 candidates, 0.449 at the 10-candidate default |
+| Emergency recall (safety set) | **100%** (25 / 25), LLM never called |
+| Out-of-scope questions answered | **0** of 23 |
+| p95 latency, normal load (CI, stubbed LLM) | **1,116 ms** |
+| Overload (20 concurrent users on 2 vCPU) | 0 errors, 24% shed with 503, served p50 31 ms |
+
+**In everyday terms:** recall@5 asks "did the right book end up in the
+librarian's top 5?" For textbook-style questions, the answer is yes about 92 times
+out of 100. For real questions people actually type ("my 3 year old has..."), it's
+about half the time, which is why the real-question set is the number to improve.
+
 <details>
-<summary><b>Full retrieval tables</b> (click to open)</summary>
+<summary><b>MedQuAD and LiveQA tables per stage</b></summary>
 
 **MedQuAD held-out questions (n = 1,000)**
 
@@ -306,8 +305,7 @@ xychart-beta
 | RRF fusion | 0.864 | 0.627 |
 | **RRF + cross-encoder rerank** | **0.925** | **0.791** |
 
-The reranker's ceiling (fused recall@20) is 0.959, so it recovers most of what fusion finds.
-MRR (mean reciprocal rank) rewards putting the right passage at #1 rather than #5.
+Reranker ceiling (fused recall@20): 0.959.
 
 **TREC 2017 LiveQA-Med, real consumer questions. SMALL: 38 questions, 96 relevant pairs**
 
@@ -318,30 +316,26 @@ MRR (mean reciprocal rank) rewards putting the right passage at #1 rather than #
 | RRF fusion | 0.393 | 0.553 | 0.398 |
 | **+ rerank** | **0.523** | **0.763** | **0.503** |
 
-The official judgments cover 39 questions / 106 pairs after copyright exclusions, but
-10 of those pairs (e.g. `NIHSeniorHealth_0000062_Sec6`) are not in the public MedQuAD
-files, so 38 / 96 can be scored.
+The qrels judge 39 questions / 106 pairs after copyright exclusions; 10 pairs (e.g.
+`NIHSeniorHealth_0000062_Sec6`) are absent from the public MedQuAD XML, so 38 / 96 are
+scorable.
 
-What the numbers say:
-- **Meaning search beats keyword search by a wide margin**, because people rarely use NIH's wording.
-- **Merging alone does not beat meaning search here.** Keyword search is weak enough to cost a little at the top, but merging widens the pool the reranker picks from.
-- **The reranker is the biggest single gain.**
-- On NIST's 38 *paraphrased* LiveQA questions, the reranker scored lower than fusion (0.439 vs 0.520). With 38 questions that's within noise, but it's reported rather than hidden.
+- **Dense beats BM25 by a wide margin**: consumer wording rarely matches NIH wording.
+- **RRF alone does not beat dense here**: BM25 is weak enough to cost a little at the top, but fusion widens the reranker's candidate pool.
+- **The cross-encoder is the biggest single gain**: +6 points on MedQuAD, +13 on LiveQA.
+- On NIST's 38 *paraphrased* LiveQA questions the reranker scored below fusion (0.439 vs 0.520). Within noise at n = 38, but reported.
 
 </details>
 
 <details>
-<summary><b>Speed vs accuracy: how many passages to rerank</b></summary>
+<summary><b>Speed vs accuracy: rerank candidates and passage length</b></summary>
 
-| Candidates per search | Reranker reads | recall@5 | rerank p50 | search p95 |
+| Candidates per retriever | Reranker reads | recall@5 | rerank p50 | search p95 |
 |---|---|---|---|---|
 | 20 | full passage | 0.924 | 1,883 ms | 3,463 ms |
 | 20 | 1,000 chars | 0.929 | 1,103 ms | 2,464 ms |
 | 20 | 500 chars | 0.926 | 782 ms | 2,174 ms |
 | **10 (default)** | **1,000 chars (default)** | **0.926** | **746 ms** | **2,063 ms** |
-
-On NIH-style questions, reranking 10 instead of 20 costs nothing and is 32% faster.
-On real questions, it **does** cost recall:
 
 | Reranked recall@5 | 20 candidates (local) | 10 candidates (CI, default) |
 |---|---|---|
@@ -349,286 +343,320 @@ On real questions, it **does** cost recall:
 | LiveQA-Med (n = 38) | 0.523 | 0.449 |
 | LiveQA paraphrased (n = 38) | 0.439 | 0.514 |
 
-Messy questions put the right passage deeper in the list, so a smaller pool loses it.
-10 is the default because it keeps p95 near 1 s on CPU. With a GPU or more cores,
-set `CANDIDATES=20`. Latencies come from a laptop; on CI the two searches together take
-~25 ms, and the reranker is ~98% of search time.
+10 candidates is free on MedQuAD and 32% faster, but costs recall on messy real
+questions, where the right passage sits deeper in the fused list. It's the default
+because it keeps p95 near 1 s on CPU; with a GPU, set `CANDIDATES=20`. The reranker is
+~98% of search time (BM25 + dense ≈ 25 ms on the CI runner).
 
 </details>
 
 <details>
-<summary><b>"No reliable information" threshold and safety results</b></summary>
+<summary><b>Threshold sweep and safety set end to end</b></summary>
 
-| Threshold (best rerank score) | In-domain questions refused | Off-topic questions answered |
+| `MIN_RERANK_SCORE` | In-domain refused | Out-of-scope answered |
 |---|---|---|
 | −6 | 0.0% | 17.4% |
 | −4 | 0.0% | 0.0% |
 | **0 (default)** | **0.2%** | **0.0%** |
 | 4 | 5.1% | 0.0% |
 
-**Safety set, end to end (100 hand-written questions)**
-
-| True label | Outcome |
+| True label (100 hand-written) | Outcome |
 |---|---|
-| emergency (25) | 25 → helplines, AI never called |
-| diagnosis / dose (24) | 24 → refused, AI never called |
-| out of scope (23) | 20 → refused by rule, 3 → "no reliable information" via the threshold, **0 answered** |
-| normal (28) | 27 answered, 1 "no reliable information" |
+| emergency (25) | 25 → helplines, LLM never called |
+| diagnosis / dose (24) | 24 → refused, LLM never called |
+| out of scope (23) | 20 refused by rule, 3 → `no_info` via threshold, **0 answered** |
+| normal (28) | 27 answered, 1 `no_info` |
 
-Router accuracy on its own: 97%, gated in CI.
+Router-only accuracy: 97%, gated in CI.
 
 </details>
 
 <details>
-<summary><b>Load test results</b></summary>
+<summary><b>Load test</b></summary>
 
-CI, 2-vCPU machine, 2 workers, AI replaced by a 300 ms stub (so this measures our service, not Groq):
+CI, 2 vCPU, 2 uvicorn workers, LLM stubbed at 300 ms (measures our service, not Groq):
 
-| Load | req/s | p50 | p95 | errors | turned away (503) |
+| Phase | req/s | p50 | p95 | errors | shed (503) |
 |---|---|---|---|---|---|
-| Before the fix: 20 users at once | 1.6 | 16.9 s | **20.9 s** | 0% | — |
-| Normal: 2 users at once (gate: p95 ≤ 3 s) | 3.1 | 706 ms | **1,116 ms** | 0% | 0% |
-| Overload: 20 users at once | 23.3 | 31 ms | 2,473 ms (served) | 0% | 24% |
-
-See [Staying up under heavy load](#staying-up-under-heavy-load) for what changed.
+| Before load shedding: 20 concurrent | 1.6 | 16.9 s | **20.9 s** | 0% | — |
+| Normal: 2 concurrent (gate p95 ≤ 3 s) | 3.1 | 706 ms | **1,116 ms** | 0% | 0% |
+| Overload: 20 concurrent | 23.3 | 31 ms | 2,473 ms (served) | 0% | 24% |
 
 </details>
 
 ---
 
-## How quality is checked
-
-```mermaid
-flowchart LR
-    subgraph ci["Every code change (CI)"]
-        UT["57 unit tests<br/>fake models, seconds"]
-        SG["Safety gate<br/>100 questions"]
-        E2E["End-to-end check<br/>23 checks, real models,<br/>Qdrant + Redis"]
-        LT["Load test<br/>normal + overload"]
-    end
-    subgraph rev["Retrieval eval (on code changes)"]
-        RE["1,000 MedQuAD +<br/>38 real questions<br/>fails if recall@5 < 0.90"]
-    end
-    subgraph judge["Answer quality (started by hand)"]
-        JE["LLM-as-judge<br/>2 judges, 50 answers"]
-    end
-```
-
-| Eval | Question it answers | Where |
-|---|---|---|
-| Retrieval eval | Is the right passage found? (recall@5, MRR, per stage) | `evals/retrieval_eval.py` |
-| Safety gate | Are emergencies, dosing and off-topic questions routed correctly? | `evals/safety_eval.py` |
-| End-to-end check | Does every feature work together on a real server? | `scripts/e2e_check.py` |
-| Load test | Does it stay fast under load, and fail gracefully under overload? | `scripts/load_test.py` |
-| LLM-as-judge | Is the *written answer* faithful to its sources? | `evals/judge_eval.py` |
-
-### LLM-as-judge: grading the answers themselves
-
-Finding the right passage doesn't guarantee a good answer. The AI could still add
-facts that aren't in the passages. So a second AI grades every answer, using the
-metric definitions from **RAGAS** (a well-known RAG evaluation framework):
-
-```mermaid
-flowchart LR
-    Q["50 questions<br/>30 NIH-style + 20 real"] --> RET["retrieve<br/>passages"]
-    RET --> GEN["generate answers<br/>in parallel"]
-    GEN --> J1["Judge 1<br/>gpt-oss-120b"]
-    GEN --> J2["Judge 2<br/>Gemini 2.5 Flash"]
-    J1 --> CMP{"Both judges<br/>flag it?"}
-    J2 --> CMP
-    CMP -- "both" --> C["CONFIRMED error<br/>fix these first"]
-    CMP -- "one" --> D["DISPUTED<br/>look before trusting"]
-```
-
-| Metric | Question it answers | If low, the problem is in... |
-|---|---|---|
-| faithfulness | Is every claim in the answer written in the passages? | the AI made something up → prompt |
-| citation accuracy | Does each `[n]` really support its sentence? | wrong citations → prompt / validator |
-| answer relevancy | Does it answer the question that was asked? | off-target answer → prompt |
-| context precision | Are the useful passages ranked first? | noisy search results → retrieval |
-| context recall | Are the NIH reference answer's facts in the passages? | the search missed it → retrieval / chunking |
-
-- **Why two judges?** A judge model tends to favour answers written in its own style. Both judges are from different families than the Llama model that writes the answers. An error both flag is *confirmed*; their agreement rate shows how far to trust each metric.
-- **Why not the `ragas` package itself?** It makes 4–8 AI calls per answer; this makes one, which fits the free tiers. The definitions are the same, and every prompt is in the file.
-- **Cost:** about 0.5M tokens per run, so it only runs when started by hand (Actions → Retrieval eval → Run workflow).
-- **Privacy:** Gemini's free tier may use what is sent to improve Google's products. That's fine for public NIH text, but real user questions would need a paid tier or a provider with a healthcare agreement.
-- **Status:** the first run is in progress; its results and the fixes they lead to will be added here.
-
-### End-to-end check
-
-`scripts/e2e_check.py` drives a running server through every feature in 23 checks:
-health and readiness, a cited answer from NIH sources, request ids, answer cache,
-thumbs-down eviction and then a passage-cache hit, streaming order, filters, the
-emergency, dosing and off-topic routes, PHI redaction, and metrics. CI runs it
-against real Qdrant and Redis with 2 workers, which proves the caches and feedback
-work *across processes*. Locally, on the full library: **23/23 pass**.
-
----
-
-## Making answers fast
-
-```mermaid
-flowchart LR
-    Q["question"] --> L1{"Answer cache<br/>1 h"}
-    L1 -- hit --> A1["answer in ~2 ms<br/>no search, no AI"]
-    L1 -- miss --> L2{"Passage cache<br/>24 h"}
-    L2 -- hit --> A2["skip search<br/>only the AI runs, ~0.3 s + AI"]
-    L2 -- miss --> A3["full search + rerank + AI<br/>~1 s + AI"]
-```
-
-Measured: answer cache **878 ms → 2 ms**. After a thumbs-down, the regenerated answer
-took **303 ms** (just the stubbed 300 ms AI), because the passage cache skipped the search.
-
-| Technique | Why it helps |
-|---|---|
-| Answer cache (Redis) | Repeated questions skip everything. Keyed on the *redacted* question, so personal details never become cache keys |
-| Passage cache (Redis) | An expired answer, a down-voted answer or an AI retry re-runs only the AI, not the search (~98% of search time). Cleared automatically after re-indexing |
-| Two searches in parallel | Total time = the slower one, not the sum |
-| Rerank 10 passages, first 1,000 chars | Fewer and shorter pairs for the slowest model; the speed table shows the trade-off |
-| Streaming (`/ask/stream`) | Sources appear right after the search; text appears as the AI writes it |
-| `LLM_MAX_TOKENS=300` | Answers are ≤150 words anyway; AI time grows with output length |
-| Warm-up at startup | The first model run is slow; each server pays that before taking traffic |
-| Models baked into the Docker image | New servers start without downloading anything |
-
-Streaming trade-off: the citation check needs the full text, so it runs at the end.
-If it fails, the final `done` event carries the safe fallback and the client replaces
-what it showed.
-
----
-
-## Learning from users (feedback)
+## Evaluation strategy
 
 ```mermaid
 flowchart TD
-    A["Answer shown<br/>with request_id"] --> V{"User votes"}
-    V -- "thumbs up" --> LOG["Vote log<br/>joined to: question, score, sources"]
-    V -- "thumbs down" --> EV["Remove that answer from the cache now<br/>next user gets a fresh one"]
-    EV --> LOG
-    LOG --> TUNE["tune_threshold.py<br/>picks the best 'no reliable info' cut-off"]
-    LOG --> REV["Down-voted questions<br/>exported for human review"]
-    REV --> EVAL["Become new eval cases<br/>CI catches it next time"]
-    TUNE --> CFG["A person updates the config"]
+    subgraph ci["CI on every push (ci.yml)"]
+        UT["pytest: 58 unit tests<br/>fake encoders, no network"]
+        SG["Safety gate<br/>confusion matrix, 100 questions"]
+        E2E["e2e_check.py: 23 checks<br/>real models, Qdrant, Redis, 2 workers"]
+        LT["load_test.py<br/>normal: p95 gate; overload: must shed"]
+    end
+    subgraph ev["Retrieval eval (eval.yml, on app or evals changes)"]
+        RE["recall@5 / MRR per stage<br/>MedQuAD n=1,000 + LiveQA n=38<br/>gate: recall@5 >= 0.90"]
+    end
+    subgraph jd["Answer quality (eval.yml, manual dispatch)"]
+        JE["judge_eval.py<br/>RAGAS-style metrics, 2 judges"]
+    end
 ```
 
-| What feedback changes | When | How |
+| Eval | Measures | File |
 |---|---|---|
-| A bad cached answer stops being served | Immediately | A thumbs-down evicts it from the cache |
-| The "no reliable info" cut-off | Offline, by a person | `scripts/tune_threshold.py` maximises *good answers kept − 3 × bad answers kept*, because a wrong health answer costs more than a refusal |
-| The test sets | Offline, by a person | Reviewed down-votes become new eval cases |
+| Retrieval | recall@5, MRR, per stage, plus the reranker ceiling | `evals/retrieval_eval.py` |
+| Safety gate | Router confusion matrix; emergency recall 100%, no emergency or dosing question reaches the LLM | `evals/safety_eval.py` |
+| End-to-end | All features on a live server: caching, feedback, streaming, filters, routes, PHI, metrics | `scripts/e2e_check.py` |
+| Load | p50 / p95 / p99, error rate, shed rate | `scripts/load_test.py` |
+| LLM-as-judge | Faithfulness, citation accuracy, answer relevancy, context precision and recall | `evals/judge_eval.py` |
 
-**Votes don't change the ranking automatically.** In a health app, unreviewed
-votes can be wrong or gamed, pushing a bad passage up for everyone. So they go
-through a person and the evals first.
+**In everyday terms:** car makers crash-test every new model before it reaches a
+showroom. Here every code change is automatically crash-tested: if an emergency
+stops being recognised, or search quality drops below 90%, the change is blocked
+before it ships.
+
+### LLM-as-judge (RAGAS-style metrics, two judges)
+
+```mermaid
+flowchart LR
+    QS["50 questions<br/>30 MedQuAD + 20 LiveQA<br/>with NIH reference answers"] --> R["retrieve<br/>sequential, CPU"]
+    R --> G["generate<br/>ThreadPoolExecutor"]
+    G --> J1["Judge A<br/>openai/gpt-oss-120b (Groq)"]
+    G --> J2["Judge B<br/>Gemini 2.5 Flash"]
+    J1 --> M["per-answer JSON:<br/>claims + support, relevance,<br/>passage relevance, reference facts"]
+    J2 --> M
+    M --> CF{"error flagged by"}
+    CF -- "both judges" --> C["confirmed -> fix first"]
+    CF -- "one judge" --> D["disputed -> inspect"]
+```
+
+| Metric | Definition (RAGAS) | Low score means → fix |
+|---|---|---|
+| faithfulness | Share of answer claims supported by the passages | hallucination → prompt / generation |
+| citation_accuracy | Share of cited claims whose `[n]` actually supports them | miscitation → prompt / validator |
+| answer_relevancy | Does the answer address the question (1–5 → 0–1) | off-target answer → prompt |
+| context_precision | Average precision of relevant passages in rank order | noisy context → retrieval / threshold |
+| context_recall | Share of reference-answer facts present in the passages | retrieval miss → retrieval / chunking |
+
+- **Two judges from different families**, neither of them Llama (the generator's family), to reduce self-preference bias. Agreement per error type is reported.
+- **One JSON judgment per answer** instead of the `ragas` package's 4–8 calls, to fit free-tier limits; same metric definitions, prompts in the file.
+- **~0.5M tokens per run**, so it runs on manual dispatch only.
+- Gemini's free tier may use submitted data to improve Google's products. That's acceptable for public NIH text, not for real user questions.
+- **Status:** the first run is in progress; results will be added here.
+
+**In everyday terms:** an exam paper is marked by **two independent examiners**.
+If both say an answer is wrong, it's wrong, and that's what gets fixed first. If
+they disagree, someone looks at it before acting. And neither examiner is the
+student's own tutor, who might go easy on a familiar style.
 
 ---
 
-## Staying up under heavy load
+## Latency: caching and streaming
 
-The search models run on CPU. The first load test (20 users at once on 2 CPU cores)
-had no errors, but **p95 was 20.9 seconds**: every request ran the reranker at the same
-time, and they all slowed each other down.
+```mermaid
+flowchart LR
+    Q["redacted question + filters"] --> L1{"L1 answer cache<br/>key answer:v1:sha256<br/>TTL 1 h"}
+    L1 -- hit --> A1["~2 ms<br/>no retrieval, no LLM"]
+    L1 -- miss --> L2{"L2 context cache<br/>key context:v1:sha256<br/>TTL 24 h"}
+    L2 -- hit --> A2["skip retrieval + rerank<br/>LLM only"]
+    L2 -- miss --> A3["full pipeline<br/>retrieval ~1 s + LLM"]
+```
 
-The fix is **load shedding**: each server works on only as many searches as it has
-cores. Extra requests wait briefly, then get an instant "busy, retry" (HTTP 503)
-instead of making everyone slow.
+Measured end to end: answer cache **878 ms → 2 ms**. After a thumbs-down evicted
+the answer, regeneration took **303 ms** (the stubbed 300 ms LLM only), because the
+context cache skipped retrieval.
+
+| Technique | Effect |
+|---|---|
+| L1 answer cache | Repeats skip the whole pipeline. Keyed on the *redacted*, normalised question + filters |
+| L2 context cache | Cache miss, down-vote or LLM retry re-runs only the LLM. Stored before the threshold, so tuning it needs no flush; cleared by ingest after a re-index |
+| Parallel BM25 + dense | Latency = max(sparse, dense), not the sum |
+| `CANDIDATES=10`, `RERANK_MAX_CHARS=1000` | Fewer, shorter cross-encoder pairs (see speed table) |
+| SSE streaming (`/ask/stream`) | Sources emitted after retrieval; tokens as generated; time-to-first-token is a metric |
+| `LLM_MAX_TOKENS=300` | Output length bounds generation time |
+| Warm-up query at startup | First ONNX inference cost paid before readiness |
+| Models baked into the image | No model download on pod start |
+| Degraded answers not cached | The next request retries the LLM |
+
+**In everyday terms:**
+- The **answer cache** is the coffee shop barista who sees you walk in and already has your usual order ready.
+- The **context cache** is a chef who keeps the vegetables already chopped: if a dish is sent back, they only cook it again instead of shopping and chopping from scratch.
+- **Streaming** is a waiter bringing the bread first while the main course is still cooking: you're not staring at an empty table.
+
+---
+
+## Human feedback loop
+
+```mermaid
+flowchart TD
+    A["response with request_id"] --> F["POST /feedback<br/>rating up / down, comment (redacted)"]
+    F --> T["join with trace:{request_id}<br/>question, route, top_score, source_ids"]
+    T --> LOG["Redis list feedback:log<br/>capped at 50,000"]
+    F -- "down + answered" --> EV["evict L1 answer cache entry"]
+    LOG --> TT["scripts/tune_threshold.py<br/>argmax over t of ups_kept - 3 x downs_kept"]
+    LOG --> RV["export down-votes -> human review"]
+    RV --> ES["new eval cases<br/>CI catches regressions"]
+    TT --> CM["person updates MIN_RERANK_SCORE<br/>in ConfigMap"]
+    F --> MET["rag_feedback_total{rating}"]
+```
+
+| Feedback effect | When | Mechanism |
+|---|---|---|
+| Bad cached answer stops being served | Immediately | Down-vote evicts the L1 entry |
+| `no_info` threshold | Offline, by a person | Utility = good answers kept − 3 × bad answers kept (a wrong health answer costs more than a refusal) |
+| Eval sets | Offline, by a person | Reviewed down-votes become new test cases |
+
+Votes **never change the ranking automatically**: in a health app, unreviewed
+votes can be wrong or gamed. One vote per `request_id`; unknown ids get 404 and
+repeat votes 409.
+
+**In everyday terms:** a restaurant comment card. If a customer says a dish was
+bad, the waiter stops serving that plate right away (cache eviction). But the head
+chef doesn't change the recipe because of one card; they read the cards weekly,
+taste the dish, and only then change it (human review, threshold tuning, new tests).
+
+---
+
+## Reliability under load
+
+### Load shedding
+
+The first CI load test (20 concurrent users, 2 vCPU) had 0% errors but **p95 = 20.9 s**:
+every request ran the cross-encoder at once and they slowed each other down (rerank
+went from ~0.5 s alone to ~18 s under contention).
 
 ```mermaid
 sequenceDiagram
-    participant U1 as User 1
-    participant U2 as User 2
-    participant P as Server (1 search slot)
-    U1->>P: question
-    P->>P: takes the slot, searches (~1 s)
-    U2->>P: question
-    P->>P: waits up to 5 s for the slot
-    alt slot frees in time
-        P-->>U2: answer
-    else still busy
-        P-->>U2: 503 busy, retry in 1 s
-        Note over U2,P: Kubernetes adds servers when they are busy
+    participant A as Request A
+    participant B as Request B
+    participant S as BoundedSemaphore(MAX_INFLIGHT=1)
+    participant H as HPA
+    A->>S: acquire
+    S-->>A: slot granted, search ~1 s
+    B->>S: acquire(timeout = QUEUE_TIMEOUT_S)
+    alt slot released in time
+        S-->>B: slot granted
+    else timeout
+        S-->>B: Overloaded -> HTTP 503, Retry-After: 1
+        Note over B,H: rag_shed_total++ and rag_inflight_searches feed autoscaling
     end
-    P-->>U1: answer
+    A->>S: release
 ```
 
-Result: under the same overload, served requests stay fast (p50 31 ms, p95 2.5 s),
-24% are turned away instantly, and there are 0 errors.
+Result under the same overload: 0 errors, served p50 31 ms, 24% shed instantly.
 
-**When the AI provider has problems:**
+**In everyday terms:** a restaurant with 10 tables. A bad host seats 40 people at
+once, and the kitchen collapses so that *everyone* waits an hour. A good host says
+"about a 5-minute wait" or "please come back shortly", and the people already seated
+get their food on time. Meanwhile the manager (autoscaler) opens another dining room.
+
+### LLM resilience
 
 ```mermaid
 flowchart LR
-    A["Llama 3.3 70B"] -- "timeout / 429 / 5xx" --> R["retry once<br/>with backoff"]
-    R -- "still failing" --> B["fallback:<br/>Llama 3.1 8B"]
-    B -- "also failing" --> S["sources-only answer<br/>NIH passages, cited"]
+    P["primary: llama-3.3-70b-versatile<br/>timeout 10 s"] -- "408 / 429 / 5xx / timeout" --> R["retry with backoff"]
+    R -- "still failing" --> F["fallback: llama-3.1-8b-instant"]
+    P -- "400 / non-retryable" --> F
+    F -- "fails" --> S["LLMError -> degraded<br/>sources-only answer"]
 ```
 
-**When Redis is down,** the caches and rate limiter **fail open**: the service keeps
-answering, just without caching. Each request is limited to 30 per minute per client.
+Streaming falls back only **before the first token**, since retrying mid-answer would
+repeat text the user has already seen.
 
-**Monitoring:** `/metrics` exports Prometheus metrics: time per stage (keyword search,
-meaning search, merge, rerank, AI, AI first token), routes taken, cache hits per layer,
-AI errors per model, fallbacks, requests turned away, and votes. Every response and log
-line has a `request_id`, so one complaint leads straight to its log lines.
+**In everyday terms:** if your usual taxi app doesn't respond, you try once more,
+then switch to a second app. If both are down, you don't stay stranded: you're
+handed a printed map (the NIH passages themselves).
+
+### Other safeguards
+
+| Mechanism | Detail |
+|---|---|
+| Rate limiting | 30 req/min per client, Redis fixed window (`INCR` + `EXPIRE`) → 429 |
+| Fail-open Redis | Cache and limiter errors are logged and skipped; the API keeps answering |
+| Input validation | Question 3–1,000 chars; unknown `sources` → 422 |
+
+**In everyday terms:** rate limiting is like an **ATM daily withdrawal limit**: it
+protects the system from one person draining it. Failing open is like a shop whose
+card machine breaks: it keeps selling for cash instead of closing.
 
 ---
 
-## How it runs in production
+## Deployment architecture
 
 ```mermaid
 flowchart TD
-    C["Clients"] --> SVC["Kubernetes Service<br/>spreads requests"]
-    SVC --> P1["API pod"]
-    SVC --> P2["API pod"]
-    SVC --> P3["... up to 10 pods"]
-    HPA["Autoscaler (HPA)<br/>2-10 pods at 70% CPU"] -. "adds / removes" .-> P3
-    P1 --> QD[("Qdrant<br/>NIH library")]
+    CL["Clients"] --> SVC["Service rag-api<br/>L4 load balancing"]
+    SVC --> P1["Pod: uvicorn, 1 worker<br/>models baked in image"]
+    SVC --> P2["Pod"]
+    SVC --> PN["Pod ... up to 10"]
+    HPA["HorizontalPodAutoscaler<br/>min 2, max 10, CPU 70%<br/>scale-down window 300 s"] -.-> PN
+    P1 --> QD[("Qdrant StatefulSet<br/>PVC 2 Gi")]
     P2 --> QD
-    P1 --> RD[("Redis<br/>caches, rate limits,<br/>votes")]
+    P1 --> RD[("Redis<br/>allkeys-lru, 256 MB")]
     P2 --> RD
-    P1 --> GQ["Groq LLM API"]
-    P2 --> GQ
-    JOB["Ingest job<br/>builds the library"] --> QD
-    PR["Prometheus"] -. "scrapes /metrics" .-> P1
+    P1 --> GQ["Groq API"]
+    JOB["Job rag-ingest<br/>initContainer: git clone MedQuAD"] --> QD
+    PROM["Prometheus"] -. "scrape /metrics" .-> P1
+    RP["readinessProbe /readyz<br/>livenessProbe /healthz"] -.-> P1
 ```
 
-- **Stateless servers:** everything they need to remember lives in Qdrant and Redis, so pods can be added or removed at any time.
-- **Health checks:** `/readyz` (models loaded and library present) decides when a pod gets traffic; `/healthz` restarts a stuck pod.
-- **One worker per pod** with the models inside the image: scale by adding pods, not threads.
-- Files: `deploy/k8s/` (Deployment, Service, HPA, Qdrant, Redis, ingest Job), `docker-compose.yml` for local use.
+- **Stateless pods**: any pod can serve any request; state is in Qdrant and Redis.
+- **Readiness** (`/readyz`: models loaded and index present) gates traffic; **liveness** (`/healthz`) restarts hung pods.
+- **One worker per pod**: scale with replicas, and keep `/metrics` per pod accurate.
+- Manifests in `deploy/k8s/`; local stack in `docker-compose.yml` (Qdrant, Redis, API, ingest, Prometheus).
+
+**In everyday terms:** a **call center**. Any agent (pod) can take your call
+because your file is in the shared system (Redis and Qdrant), not on one agent's
+desk. When the queue grows, the supervisor (HPA) calls in more agents; a switchboard
+(Service) routes each call to a free line; and an agent who stops responding is
+replaced (liveness probe).
 
 ---
 
-## Run it yourself
+## Observability
 
-**1. Tests only (no downloads, ~10 s):**
+| Signal | Detail |
+|---|---|
+| `rag_stage_latency_seconds{stage}` | Histogram per stage: `sparse`, `dense`, `fusion`, `rerank`, `llm`, `llm_first_token` |
+| `rag_request_latency_seconds` | End-to-end latency |
+| `rag_requests_total{route}` | answered / degraded / no_info / emergency / diagnosis_dose / out_of_scope |
+| `rag_cache_total{layer,result}` | answer and context cache hit / miss / error |
+| `rag_llm_calls_total{model,outcome}`, `rag_degraded_total{reason}` | LLM health and fallbacks |
+| `rag_shed_total`, `rag_inflight_searches`, `rag_rate_limited_total` | Capacity pressure |
+| `rag_feedback_total{rating}` | User votes |
+| JSON logs with `request_id` | One object per line; the redacted question only; `X-Request-ID` echoed or generated |
+
+**In everyday terms:** this is the car's **dashboard**: speed (latency), fuel
+(capacity), warning lights (errors and fallbacks). The `request_id` is a **parcel
+tracking number**: one complaint leads straight to that request's log lines.
+
+---
+
+## Run it
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest -q
-python -m evals.safety_eval
+pytest -q                                # unit tests, fake models
+python -m evals.safety_eval              # safety confusion matrix + gates
 ```
 
-**2. The full app with Docker:**
-
 ```bash
-export GROQ_API_KEY=...                  # free key from console.groq.com, or:
-export LLM_PROVIDER=stub                 # run without any key (fake AI answers)
+export GROQ_API_KEY=...                  # free key from console.groq.com
+export LLM_PROVIDER=stub                 # or: run without any key (fake LLM)
 docker compose up -d --build
-docker compose run --rm ingest           # build the NIH library once
+docker compose run --rm ingest           # build the index once
 curl -s localhost:8000/ask -H 'content-type: application/json' -d '{"question":"What causes glaucoma?"}'
 ```
 
-**3. The evals:**
-
 ```bash
-bash scripts/download_data.sh            # MedQuAD + LiveQA at pinned versions
-python -m evals.retrieval_eval           # retrieval quality per stage
-python scripts/e2e_check.py --url http://localhost:8000   # against a running server
-GROQ_API_KEY=... GEMINI_API_KEY=... python -m evals.judge_eval   # answer quality
+bash scripts/download_data.sh            # MedQuAD + LiveQA at pinned commits
+python -m evals.retrieval_eval           # retrieval eval per stage
+python scripts/e2e_check.py --url http://localhost:8000
+GROQ_API_KEY=... GEMINI_API_KEY=... python -m evals.judge_eval
 ```
-
-**4. Kubernetes:**
 
 ```bash
 kubectl create secret generic groq --from-literal=GROQ_API_KEY=...
@@ -637,58 +665,45 @@ kubectl apply -f deploy/k8s/
 
 ---
 
-## API
+## API reference
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /ask` | `{"question", "sources"?, "qtypes"?}` → `route`, `answer`, `sources`, `model`, `cached`, `context_cached`, `request_id` |
+| `POST /ask/stream` | Server-sent events: `sources` → `token`… → `done` (validated; carries `request_id`) |
+| `POST /feedback` | `{"request_id", "rating": "up"\|"down", "comment"?}`; a down-vote evicts the cached answer |
+| `GET /healthz`, `GET /readyz` | Liveness, readiness |
+| `GET /metrics` | Prometheus |
 
 ```bash
-# ask
-curl -s localhost:8000/ask -H 'content-type: application/json' \
-  -d '{"question": "How is cystic fibrosis treated?"}'
-
-# ask with filters: only genetics pages, only "inheritance" sections
 curl -s localhost:8000/ask -H 'content-type: application/json' \
   -d '{"question": "Is it inherited?", "sources": ["GHR", "GARD"], "qtypes": ["inheritance"]}'
 
-# streaming: sources first, then text as it is written, then a checked "done"
 curl -N localhost:8000/ask/stream -H 'content-type: application/json' \
   -d '{"question": "What causes glaucoma?"}'
 
-# rate an answer, using the request_id it returned
 curl -s localhost:8000/feedback -H 'content-type: application/json' \
   -d '{"request_id": "<id from /ask>", "rating": "down", "comment": "did not answer my question"}'
 ```
 
-| Endpoint | Purpose |
-|---|---|
-| `POST /ask` | Full answer with sources, route, `cached`, `context_cached`, `request_id` |
-| `POST /ask/stream` | Server-sent events: `sources` → `token`… → `done` |
-| `POST /feedback` | `up` / `down` on an answer; a down-vote evicts it from the cache |
-| `GET /healthz`, `GET /readyz` | Liveness and readiness |
-| `GET /metrics` | Prometheus metrics |
-
-Possible `route` values: `answered`, `degraded` (safe fallback), `no_info`,
-`emergency`, `diagnosis_dose`, `out_of_scope`.
+Status codes: `422` invalid input or unknown source, `429` rate limited, `503`
+shed (with `Retry-After: 1`), `404` / `409` unknown or repeated feedback.
 
 ---
 
-## What it does not do yet
+## Known limitations
 
-Built the way a production service is built, but proven only on one CI machine.
-
-| Gap | Why it matters |
+| Limitation | Impact / next step |
 |---|---|
-| ~1.5 requests/s per pod; the CPU reranker is the bottleneck | 100 req/s would need ~70 pods. A GPU or hosted reranker is the real fix |
-| Real consumer questions: ~45–52% recall@5 | The weakest number. Next experiments: a synonym graph from MedQuAD's UMLS annotations, and splitting long sections |
-| Not yet deployed to a real cluster | Load numbers are for one machine |
-| Autoscaling on CPU | In-flight searches would be a truer "pod is full" signal |
-| One Qdrant and one Redis, no backups | Single points of failure |
-| No login or TLS; rate limit is per IP | Anyone who can reach it can use it |
-| Metrics, but no tracing, alerts or SLOs | Problems are found by users, not alerts |
-| Regex PHI redaction, third-party AI | Real patient data needs a HIPAA agreement, audit logs and encryption, or a self-hosted model |
-| 100 hand-written safety questions | A regression test, not clinical validation |
-
-Other honest caveats: MedQuAD questions are templated ("What causes X ?"), so that
-benchmark is easier than real traffic. LiveQA is the realistic one, but at 38
-questions a few points of difference is noise.
+| ~1.5 req/s per pod; CPU cross-encoder is the bottleneck | 100 req/s ≈ 70 pods. A GPU or hosted reranker is the real fix |
+| LiveQA recall@5 ≈ 0.45–0.52 | Weakest metric. Next: a UMLS synonym graph from MedQuAD's annotations, and small-to-big chunking for long sections |
+| Not deployed to a real cluster | Load numbers are single-machine |
+| HPA on CPU | In-flight searches / shed rate is the truer saturation signal |
+| Single Qdrant and Redis, no backups, re-index not zero-downtime | Single points of failure; Qdrant collection aliases would fix the re-index |
+| No auth or TLS; rate limit per IP | Needs API keys or OAuth at a gateway |
+| Metrics only: no tracing, alerts or SLOs | Add OpenTelemetry and alert rules |
+| Regex PHI redaction, third-party LLM | Real PHI needs a BAA with the provider, audit logs and encryption, or a self-hosted model |
+| 100 hand-written safety questions; MedQuAD questions are templated; LiveQA n = 38 | Regression tests, not clinical validation; small-sample noise |
 
 ---
 
@@ -696,32 +711,53 @@ questions a few points of difference is noise.
 
 ```text
 app/
-  main.py        API: /ask, /ask/stream, /feedback, health, metrics
-  safety.py      PHI redaction, safety router, fixed safety messages
-  retrieval.py   keyword + meaning search in Qdrant, RRF, rerank, load shedding
-  answer.py      the pipeline: route -> search -> threshold -> AI -> check citations
+  main.py        FastAPI: /ask, /ask/stream, /feedback, /healthz, /readyz, /metrics
+  safety.py      PHI redaction, rule-based router, fixed safety messages
+  retrieval.py   BM25 + dense in Qdrant, RRF, cross-encoder rerank, load shedding
+  answer.py      pipeline: route -> retrieve -> threshold -> LLM -> validate citations
   llm.py         Groq client: timeout, retry, fallback; stub for tests
-  cache.py       answer + passage caches, rate limiter (fail open)
-  feedback.py    request traces, votes, threshold choice from votes
+  cache.py       L1 answer + L2 context cache, rate limiter (fail open)
+  feedback.py    request traces, votes, threshold selection
   logs.py        JSON logs with request id
   metrics.py     Prometheus metrics
   data.py        MedQuAD XML -> chunks
-  ingest.py      builds the library
+  ingest.py      index build (+ context cache invalidation)
 evals/           retrieval, safety, answer and LLM-as-judge evals
-scripts/         data download, load test, end-to-end check, threshold tuning
+scripts/         data download, load test, e2e check, threshold tuning
 deploy/          Kubernetes manifests, Prometheus config
-tests/           unit tests with fake models
+tests/           unit tests with fake encoders
 ```
 
-All settings are environment variables (see `app/config.py`):
-
-| Group | Variables |
+| Group | Environment variables |
 |---|---|
 | Storage | `QDRANT_URL`, `REDIS_URL` |
-| AI | `GROQ_API_KEY`, `LLM_PROVIDER` (`groq` / `stub`), `LLM_PRIMARY_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_TIMEOUT_S`, `LLM_RETRIES`, `LLM_MAX_TOKENS` |
+| LLM | `GROQ_API_KEY`, `LLM_PROVIDER` (`groq` / `stub`), `LLM_PRIMARY_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_TIMEOUT_S`, `LLM_RETRIES`, `LLM_MAX_TOKENS` |
 | Retrieval | `CANDIDATES`, `TOP_K`, `RERANK_MAX_CHARS`, `MIN_RERANK_SCORE` |
 | Caching and limits | `CACHE_TTL_S`, `CONTEXT_CACHE_TTL_S`, `RATE_LIMIT_PER_MIN` |
 | CPU protection | `MAX_INFLIGHT`, `QUEUE_TIMEOUT_S`, `ONNX_THREADS` |
+
+---
+
+## Glossary
+
+| Term | Technical meaning | Everyday comparison |
+|---|---|---|
+| RAG | Retrieve relevant documents, then generate an answer conditioned on them | An open-book exam instead of answering from memory |
+| Hallucination | Fluent output not supported by any source | Someone confidently making up an answer |
+| Chunk | The unit of retrieval; here one MedQuAD QA section | One index card in a card catalogue |
+| Embedding | Dense vector representation of text meaning | A GPS coordinate for meaning: close points mean similar ideas |
+| BM25 | Sparse lexical ranking (term frequency × IDF) | The index at the back of a book |
+| Bi-encoder (dense) | Query and passage embedded separately, compared by cosine | Matching by description rather than exact words |
+| Cross-encoder | Query and passage scored jointly by one model | An interview instead of a CV skim |
+| RRF | Rank fusion: Σ 1 / (k + rank) | Combining two friends' top-10 lists |
+| Qdrant | Vector database with payload filters | A library organised by topic and meaning |
+| Redis | In-memory key-value store | A whiteboard everyone in the office can read and write fast |
+| PHI | Protected Health Information | Personal details blacked out before copying a form |
+| recall@5 / MRR | Gold item in top 5 / mean of 1 ÷ rank of the first gold item | "Was the right book in the top 5?" / "How near the top was it?" |
+| p50 / p95 | Median / 95th-percentile latency | Your typical commute / your commute on a bad day |
+| Load shedding | Reject excess work early with 503 | A host saying "short wait" instead of overfilling the kitchen |
+| HPA | Kubernetes autoscaler adding pods under load | Opening more checkout counters when queues grow |
+| LLM-as-judge | A model grades another model's output | Two examiners marking the same paper |
 
 ---
 
@@ -729,10 +765,10 @@ All settings are environment variables (see `app/config.py`):
 
 | | |
 |---|---|
-| Library | [MedQuAD](https://github.com/abachaa/MedQuAD) (CC BY 4.0): 9 NIH sources (GHR, GARD, NIDDK, NINDS, MedlinePlus, NIHSeniorHealth, CancerGov, NHLBI, CDC) |
-| Excluded | `10_MPlus_ADAM`, `11_MPlusDrugs`, `12_MPlusHerbs`: their answers were removed from the public release for copyright |
-| Size | 5,476 NIH pages → **16,407 chunks** |
-| Chunk ids | Same as the official answer ids: `GHR_0000804_Sec2` = source GHR, document 0000804, section 2 |
+| Corpus | [MedQuAD](https://github.com/abachaa/MedQuAD) (CC BY 4.0): GHR, GARD, NIDDK, NINDS, MedlinePlus Health Topics, NIHSeniorHealth, CancerGov, NHLBI, CDC |
+| Excluded | `10_MPlus_ADAM`, `11_MPlusDrugs`, `12_MPlusHerbs`: answers removed from the public release for copyright |
+| Size | 5,476 pages → **16,407 chunks** |
+| Chunk ids | Official answer ids: `GHR_0000804_Sec2` = source GHR, document 0000804, QA pair 2 |
 
 MedQuAD: Ben Abacha & Demner-Fushman, *A Question-Entailment Approach to Question
 Answering*, BMC Bioinformatics 2019. TREC 2017 LiveQA Medical: Ben Abacha et al., TREC 2017.
