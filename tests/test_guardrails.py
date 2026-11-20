@@ -4,7 +4,7 @@ from app.config import Settings
 from app.llm import StubLLM
 from tests.fakes import FakeLLM, FakeRetriever
 
-S = Settings(min_rerank_score=0.0, top_k=5, grounding_min_support=0.5)
+S = Settings(min_rerank_score=0.0, top_k=5, grounding_min_support=0.5, grounding_enforce=True)
 PASSAGE = "Glaucoma\nGlaucoma damages the optic nerve."
 
 
@@ -45,10 +45,10 @@ def test_word_forms_count_as_support():
     assert guardrails.ungrounded("Doctors treated the condition early. [1]", ["Early treatment of the condition helps."], 0.5) == []
 
 
-def test_grounding_check_can_be_disabled():
-    s = Settings(min_rerank_score=0.0, grounding_min_support=0.0)
+def test_shadow_mode_scores_but_does_not_block():
+    s = Settings(min_rerank_score=0.0, grounding_min_support=0.5, grounding_enforce=False)
     a = Assistant(FakeRetriever(), FakeLLM(text="Carrots reverse retinal blindness entirely. [1]"), s).answer("What is glaucoma?")
-    assert a.route == "answered"
+    assert a.route == "answered" and a.grounding_support == 0.0
 
 
 def test_llm_outage_answer_also_carries_disclaimer():

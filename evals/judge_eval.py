@@ -76,7 +76,10 @@ def judge_client(spec: str, s: Settings) -> GroqLLM:
     # Reasoning models (gpt-oss, Gemini 2.5) spend hidden tokens before the JSON; leave room.
     js = replace(s, groq_url=url, groq_api_key=key, primary_model=model, fallback_model=model,
                  llm_max_tokens=4000, llm_timeout_s=120, llm_retries=4)
-    return GroqLLM(js, backoff_s=4, extra_body={"response_format": {"type": "json_object"}})
+    extra = {"response_format": {"type": "json_object"}}
+    if provider == "gemini":
+        extra["reasoning_effort"] = "low"  # default thinking took ~88 s per judgment in the smoke test
+    return GroqLLM(js, backoff_s=4, extra_body=extra)
 
 
 def pick_judges(spec: str) -> list[str]:
@@ -201,6 +204,20 @@ def summarise(items, judges):
     return report
 
 
+def grounding_calibration(items, judges, thresholds=(0.2, 0.3, 0.4, 0.5, 0.6)):
+    """For each GROUNDING_MIN_SUPPORT candidate: how many answers BOTH judges call
+    fully faithful it would block (false blocks), and how many confirmed
+    hallucinations it would catch. Pick the highest threshold with ~0 false blocks."""
+    graded = [it for it in items if it["route"] == "answered" and it.get("grounding_support") is not None
+              and all("judge_error" not in it["judgments"][j] for j in judges)]
+    good = [it for it in graded if all(it["judgments"][j]["faithfulness"] == 1.0 for j in judges)]
+    bad = [it for it in graded if all("hallucination" in errors_of(it["judgments"][j]) for j in judges)]
+    return [{"threshold": t,
+             "faithful_blocked": f"{sum(it['grounding_support'] < t for it in good)}/{len(good)}",
+             "hallucinations_caught": f"{sum(it['grounding_support'] < t for it in bad)}/{len(bad)}"}
+            for t in thresholds]
+
+
 def to_markdown(report, items, judges):
     lines = [f"### LLM-as-judge answer quality ({report['n']} questions, judges: {', '.join(judges)})", "",
              f"Routes: {report['routes']}", "",
@@ -211,6 +228,11 @@ def to_markdown(report, items, judges):
               "|---|---|---|---|"]
     for name, e in report["errors"].items():
         lines.append(f"| {name} | {e['confirmed']}/{e['of']} | {e['disputed']}/{e['of']} | {report['agreement'][name]} |")
+    lines += ["", "**Grounding-guardrail calibration** (lexical support vs both judges):", "",
+              "| GROUNDING_MIN_SUPPORT | faithful answers blocked | confirmed hallucinations caught |",
+              "|---|---|---|"]
+    for row in report.get("grounding_calibration", []):
+        lines.append(f"| {row['threshold']} | {row['faithful_blocked']} | {row['hallucinations_caught']} |")
     lines += ["", "**Confirmed hallucinations (unsupported claims):**"]
     for it in items:
         if it["route"] != "answered":
@@ -255,6 +277,7 @@ def main():
     def generate(it):
         a = gen.answer(it["question"])
         return {**it, "route": a.route, "answer": a.answer, "sources": a.sources, "model": a.model,
+                "blocked_by": a.blocked_by, "grounding_support": a.grounding_support,
                 "passage_text": [h.payload["text"][:1500] for h in hits[it["question"]]]}
 
     with ThreadPoolExecutor(args.workers) as pool:
@@ -272,6 +295,7 @@ def main():
             it["judgments"][jm] = m
 
     report = summarise(items, judges)
+    report["grounding_calibration"] = grounding_calibration(items, judges)
     md = to_markdown(report, items, judges)
     print(md)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)

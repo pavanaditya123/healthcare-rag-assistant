@@ -36,8 +36,12 @@ class Settings:
     # Below this cross-encoder score we say "no reliable info" (tuned in evals/)
     min_rerank_score: float = float(_env("MIN_RERANK_SCORE", "0.0"))
     # Output guardrail: share of a cited sentence's content words that must appear in
-    # its cited passages (see guardrails.ungrounded). 0 disables the check.
+    # its cited passages (see guardrails.ungrounded).
     grounding_min_support: float = float(_env("GROUNDING_MIN_SUPPORT", "0.5"))
+    # Shadow mode by default: score and count every answer, but only BLOCK once the
+    # threshold is calibrated against the LLM-as-judge (evals/judge_eval.py). Real
+    # gpt-oss answers paraphrase, and 0.5 blocked good answers in the smoke test.
+    grounding_enforce: bool = _env("GROUNDING_ENFORCE", "false").lower() == "true"
 
     # LLM (Groq, OpenAI-compatible API)
     llm_provider: str = _env("LLM_PROVIDER", "groq")   # "groq" or "stub"

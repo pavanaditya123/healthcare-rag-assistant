@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field
 from app import guardrails, safety
 from app.config import Settings
 from app.llm import LLMError
-from app.metrics import DEGRADED
+from app.metrics import DEGRADED, GROUNDING_FLAGGED
 from app.retrieval import Hit
 
 SYSTEM_PROMPT = (
@@ -35,6 +35,7 @@ class Answer:
     model: str | None = None
     context_cached: bool = False  # passages came from the context cache (retrieval skipped)
     blocked_by: str | None = None  # which guardrail replaced the LLM text, if any
+    grounding_support: float | None = None  # weakest sentence's lexical support (guardrails.py)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -123,16 +124,24 @@ class Assistant:
         """Output guardrails, shared by /ask and /ask/stream. Any failure means
         the user gets the NIH passages verbatim instead of generated text."""
         passages = [h.payload["text"][:MAX_SOURCE_CHARS] for h in hits]
+        support = guardrails.min_support(text, passages)
+        weak = support is not None and support < self.s.grounding_min_support
         if not citations_valid(text, len(hits)):
             reason = "invalid_citations"
         elif guardrails.unsafe_output(text):
             reason = "unsafe_output:" + guardrails.unsafe_output(text)
-        elif self.s.grounding_min_support and guardrails.ungrounded(text, passages, self.s.grounding_min_support):
+        elif weak and self.s.grounding_enforce:
             reason = "ungrounded"
         else:
-            return Answer("answered", guardrails.add_disclaimer(text.strip()), srcs, model, ctx)
+            if weak:  # shadow mode: count it, don't block
+                GROUNDING_FLAGGED.labels("shadow").inc()
+            return Answer("answered", guardrails.add_disclaimer(text.strip()), srcs, model, ctx,
+                          grounding_support=support)
+        if reason == "ungrounded":
+            GROUNDING_FLAGGED.labels("blocked").inc()
         DEGRADED.labels(reason.split(":")[0]).inc()
-        return Answer("degraded", guardrails.add_disclaimer(sources_only(hits)), srcs, model, ctx, blocked_by=reason)
+        return Answer("degraded", guardrails.add_disclaimer(sources_only(hits)), srcs, model, ctx,
+                      blocked_by=reason, grounding_support=support)
 
     def degraded_llm_down(self, hits, srcs, model, ctx) -> Answer:
         DEGRADED.labels("llm_unavailable").inc()

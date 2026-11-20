@@ -58,15 +58,15 @@ def content_stems(text: str) -> set[str]:
     return {w[:5] for w in words if w not in STOPWORDS}
 
 
-def ungrounded(text: str, passages: list[str], min_support: float) -> list[str]:
-    """Sentences whose content words are mostly NOT in the passages they cite.
+def sentence_supports(text: str, passages: list[str]) -> list[tuple[str, float]]:
+    """(sentence, support) for every judgeable sentence of the answer.
 
     A paragraph's citations apply to every sentence in it (answers cite at the
     end of a paragraph). Support = share of a sentence's content stems found in
     the cited passages. This is a cheap lexical check, run on every request; the
     LLM-as-judge eval measures faithfulness properly, offline.
     """
-    bad = []
+    out = []
     for para in re.split(r"\n\s*\n", text.strip()):
         cited = {int(n) for n in CITATION.findall(para) if 1 <= int(n) <= len(passages)}
         if not cited:
@@ -74,12 +74,20 @@ def ungrounded(text: str, passages: list[str], min_support: float) -> list[str]:
         source_stems = set().union(*(content_stems(passages[n - 1]) for n in cited))
         for sentence in _SENTENCE.split(para):
             stems = content_stems(CITATION.sub("", sentence))
-            if len(stems) < 3:
-                continue  # too short to judge ("See [1].")
-            support = len(stems & source_stems) / len(stems)
-            if support < min_support:
-                bad.append(sentence.strip())
-    return bad
+            if len(stems) >= 3:  # shorter ones ("See [1].") are too short to judge
+                out.append((sentence.strip(), len(stems & source_stems) / len(stems)))
+    return out
+
+
+def min_support(text: str, passages: list[str]) -> float | None:
+    """The weakest sentence's support (None if nothing was judgeable)."""
+    supports = [v for _, v in sentence_supports(text, passages)]
+    return min(supports) if supports else None
+
+
+def ungrounded(text: str, passages: list[str], threshold: float) -> list[str]:
+    """Sentences whose support is below the threshold."""
+    return [sent for sent, v in sentence_supports(text, passages) if v < threshold]
 
 
 # ---------------------------------------------------------------- 4. disclaimer

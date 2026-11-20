@@ -16,5 +16,6 @@ LLM_CALLS = Counter("rag_llm_calls_total", "LLM calls", ["model", "outcome"])  #
 DEGRADED = Counter("rag_degraded_total", "Sources-only answers", ["reason"])
 RATE_LIMITED = Counter("rag_rate_limited_total", "Requests rejected by rate limiter")
 SHED = Counter("rag_shed_total", "Requests rejected because the pod was at capacity")
+GROUNDING_FLAGGED = Counter("rag_grounding_flagged_total", "Answers below the grounding threshold", ["action"])
 FEEDBACK = Counter("rag_feedback_total", "User votes on answers", ["rating"])  # up / down
 INFLIGHT = Gauge("rag_inflight_searches", "Searches currently using the CPU")

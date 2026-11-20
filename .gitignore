@@ -5,4 +5,4 @@ __pycache__/
 data/
 models_cache/
 qdrant_storage/
-evals/results/*.tmp
+evals/results/

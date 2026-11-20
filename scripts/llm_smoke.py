@@ -76,10 +76,11 @@ def main():
                 ("empty (reasoning used all tokens?)", not text.strip()),
                 ("citations invalid", not citations_valid(text, 1)),
                 (f"unsafe: {guardrails.unsafe_output(text)}", bool(guardrails.unsafe_output(text))),
-                ("ungrounded", bool(guardrails.ungrounded(text, [PASSAGE], s.grounding_min_support))),
             ] if bad]
+            support = guardrails.min_support(text, [PASSAGE])
             report(f"{role}: {model}", not problems,
-                   f"{ms:.0f} ms, {len(text)} chars" + (f", {'; '.join(problems)}" if problems else "") +
+                   f"{ms:.0f} ms, {len(text)} chars, grounding support {support}" +
+                   (f", {'; '.join(problems)}" if problems else "") +
                    f" | {text.strip()[:90]!r}")
         except Exception as e:  # noqa: BLE001
             report(f"{role}: {model}", False, describe(e))
