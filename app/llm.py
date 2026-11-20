@@ -23,8 +23,10 @@ class LLMError(Exception):
 
 
 class GroqLLM:
-    def __init__(self, s: Settings, http: httpx.Client | None = None, backoff_s: float = 0.5):
+    def __init__(self, s: Settings, http: httpx.Client | None = None, backoff_s: float = 0.5,
+                 extra_body: dict | None = None):
         self.s = s
+        self.extra_body = extra_body or {}  # e.g. {"response_format": {"type": "json_object"}} for the judge
         self.http = http or httpx.Client(timeout=s.llm_timeout_s)
         self.backoff_s = backoff_s
 
@@ -32,7 +34,8 @@ class GroqLLM:
         resp = self.http.post(
             self.s.groq_url,
             headers={"Authorization": f"Bearer {self.s.groq_api_key}"},
-            json={"model": model, "messages": messages, "temperature": 0, "max_tokens": self.s.llm_max_tokens},
+            json={"model": model, "messages": messages, "temperature": 0, "max_tokens": self.s.llm_max_tokens,
+                  **self.extra_body},
             timeout=self.s.llm_timeout_s,
         )
         resp.raise_for_status()

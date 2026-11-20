@@ -8,6 +8,7 @@ on:
   workflow_dispatch:
 
 env:
+  GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
   FASTEMBED_CACHE_PATH: /home/runner/.cache/fastembed
 
 jobs:
@@ -28,6 +29,9 @@ jobs:
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python -m evals.retrieval_eval --sample 1000 --min-medquad-recall 0.90
+      - name: Answer quality, LLM-as-judge (two judges, RAGAS-style metrics)
+        if: env.GROQ_API_KEY != ''   # skipped until the repo secret is set
+        run: python -m evals.judge_eval --medquad 30 --liveqa 20
       - uses: actions/upload-artifact@v4
         with:
           name: eval-results
