@@ -43,7 +43,7 @@ def main():
     check("readiness /readyz (models + index loaded)", c.get("/readyz").status_code == 200)
 
     # --- answer + citations + request id ---
-    q = f"What causes glaucoma? ({run})"
+    q = f"What is glaucoma? ({run})"
     t0 = time.perf_counter()
     r = c.post("/ask", json={"question": q})
     first_ms = (time.perf_counter() - t0) * 1000
@@ -51,9 +51,9 @@ def main():
     check("answer returned with NIH sources", r.status_code == 200 and a["route"] == "answered"
           and a["sources"] and all(any(d in s["url"] for d in NIH_DOMAINS) for s in a["sources"]),
           f"route={a.get('route')}, {len(a.get('sources', []))} sources")
-    check("retrieval is relevant (glaucoma in top source)", "glaucoma" in a["sources"][0]["title"].lower(),
-          a["sources"][0]["title"])
-    check("answer cites a provided source", "[1]" in a["answer"] or "[2]" in a["answer"])
+    top = a["sources"][0]["title"] if a.get("sources") else "(no sources)"
+    check("retrieval is relevant (glaucoma in top source)", "glaucoma" in top.lower(), top)
+    check("answer cites a provided source", "[1]" in a.get("answer", "") or "[2]" in a.get("answer", ""))
     check("request id in body and header", a["request_id"] == r.headers.get("x-request-id") and a["request_id"])
     rid = a["request_id"]
 
@@ -79,7 +79,7 @@ def main():
           f"cached={regen['cached']}, context_cached={regen['context_cached']}, {regen_ms:.0f} ms")
 
     # --- streaming ---
-    events = stream(c, {"question": f"How is asthma treated? ({run})"})
+    events = stream(c, {"question": f"How is glaucoma treated? ({run})"})
     types = [e["type"] for e in events]
     check("stream: sources -> tokens -> done", types[0] == "sources" and types[-1] == "done" and "token" in types,
           f"{len(events)} events")

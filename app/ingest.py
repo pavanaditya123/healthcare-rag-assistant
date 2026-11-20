@@ -14,12 +14,15 @@ from app.retrieval import Encoders, HybridRetriever, make_client
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--medquad", default="data/MedQuAD")
-    ap.add_argument("--limit", type=int, default=0, help="index only the first N chunks (smoke tests)")
+    ap.add_argument("--limit", type=int, default=0, help="index N chunks spread evenly over the corpus (smoke tests)")
     args = ap.parse_args()
 
     chunks = load_medquad(args.medquad)
-    if args.limit:
-        chunks = chunks[: args.limit]
+    if args.limit and args.limit < len(chunks):
+        # Every k-th chunk, not the first N: the files are ordered by source, so the
+        # first 3,000 would be only CancerGov + GARD. An even spread keeps all 9 sources.
+        step = len(chunks) / args.limit
+        chunks = [chunks[int(i * step)] for i in range(args.limit)]
     print(f"loaded {len(chunks)} chunks from {len({c.url for c in chunks})} NIH pages")
 
     retriever = HybridRetriever(make_client(settings), Encoders(settings), settings)
