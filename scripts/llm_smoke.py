@@ -1,73 +1,106 @@
-"""One tiny request to every configured LLM, to diagnose keys and model names.
+"""Smoke test of every configured LLM through the REAL production code path.
 
     GROQ_API_KEY=... GEMINI_API_KEY=... python scripts/llm_smoke.py
 
-Prints the HTTP status, the provider's error message and whether each model is
-in the provider's model list. Never prints keys. Costs a few tokens.
+1. key shape + model lists (catches revoked keys and retired model names)
+2. generator: primary and fallback each answer a real RAG prompt via GroqLLM,
+   then the answer goes through the output guardrails
+3. judges: each returns valid JSON for the real judge prompt
+
+Never prints keys. A few thousand tokens in total.
 """
+import json
 import os
 import sys
+import time
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app.llm import describe  # noqa: E402
+from app import guardrails  # noqa: E402
+from app.answer import build_messages, citations_valid  # noqa: E402
+from app.config import Settings  # noqa: E402
+from app.llm import GroqLLM, describe  # noqa: E402
+from app.retrieval import Hit  # noqa: E402
+from evals.judge_eval import GEMINI_URL, JUDGE_PROMPT, judge_client, pick_judges, score  # noqa: E402
 
-GROQ = "https://api.groq.com/openai/v1"
-GEMINI = "https://generativelanguage.googleapis.com/v1beta/openai"
-CHECKS = [  # (provider, base url, key env var, model)
-    ("groq", GROQ, "GROQ_API_KEY", os.getenv("LLM_PRIMARY_MODEL", "llama-3.3-70b-versatile")),
-    ("groq", GROQ, "GROQ_API_KEY", os.getenv("LLM_FALLBACK_MODEL", "llama-3.1-8b-instant")),
-    ("groq", GROQ, "GROQ_API_KEY", "openai/gpt-oss-120b"),
-    ("gemini", GEMINI, "GEMINI_API_KEY", "gemini-2.5-flash"),
-]
+GROQ_MODELS = "https://api.groq.com/openai/v1/models"
+GEMINI_MODELS = GEMINI_URL.replace("/chat/completions", "/models")
+PASSAGE = ("Glaucoma\nGlaucoma is a group of diseases that damage the optic nerve. Treatment usually "
+           "includes prescription eye drops, laser surgery or conventional surgery to lower eye pressure.")
+HIT = Hit("NEI_0000001_Sec2", 5.0, {"focus": "Glaucoma", "url": "https://www.nei.nih.gov/glaucoma", "text": PASSAGE})
+results = []
+
+
+def report(name, ok, detail):
+    results.append(ok)
+    print(f"[{'OK' if ok else 'FAIL'}]   {name:40} {detail}")
 
 
 def key_shape(key: str) -> str:
-    """Enough to spot a pasting mistake (quotes, spaces, empty), nothing secret."""
     if not key:
         return "MISSING"
-    issues = [name for name, bad in [("leading/trailing whitespace", key != key.strip()),
-                                     ("quote characters", '"' in key or "'" in key)] if bad]
+    issues = [n for n, bad in [("surrounding whitespace", key != key.strip()), ("quotes", '"' in key or "'" in key)] if bad]
     return f"present, {len(key)} chars" + (f", has {', '.join(issues)}" if issues else "")
 
 
-def main():
-    listed = {}
-    for provider, base, env in {(p, b, e) for p, b, e, _ in CHECKS}:
-        key = os.getenv(env, "")
-        print(f"{env}: {key_shape(key)}")
-        if not key:
-            continue
-        try:
-            r = httpx.get(f"{base}/models", headers={"Authorization": f"Bearer {key.strip()}"}, timeout=20)
-            r.raise_for_status()
-            listed[provider] = {m["id"].removeprefix("models/") for m in r.json().get("data", [])}
-            print(f"  {provider} /models: HTTP 200, {len(listed[provider])} models")
-        except Exception as e:  # noqa: BLE001 - diagnostic script, report everything
-            print(f"  {provider} /models: {describe(e)}")
+def list_models(url, key):
+    r = httpx.get(url, headers={"Authorization": f"Bearer {key}"}, timeout=20)
+    r.raise_for_status()
+    return {m["id"].removeprefix("models/") for m in r.json().get("data", [])}
 
-    ok = True
-    for provider, base, env, model in CHECKS:
-        key = os.getenv(env, "").strip()
-        if not key:
-            continue
-        in_list = "listed" if model in listed.get(provider, set()) else "NOT in model list"
+
+def main():
+    s = Settings()
+    gemini_key = os.getenv("GEMINI_API_KEY", "")
+    print(f"GROQ_API_KEY: {key_shape(s.groq_api_key)}\nGEMINI_API_KEY: {key_shape(gemini_key)}")
+    listed = {}
+    for name, url, key in [("groq", GROQ_MODELS, s.groq_api_key), ("gemini", GEMINI_MODELS, gemini_key)]:
+        if key:
+            try:
+                listed[name] = list_models(url, key.strip())
+                print(f"  {name} /models: {len(listed[name])} models")
+            except Exception as e:  # noqa: BLE001 - diagnostic script
+                print(f"  {name} /models: {describe(e)}")
+
+    # 2. generator, real prompt, real client, real guardrails
+    for role, model in [("generator primary", s.primary_model), ("generator fallback", s.fallback_model)]:
+        llm = GroqLLM(replace(s, primary_model=model, fallback_model=model, llm_retries=0))
+        t0 = time.perf_counter()
         try:
-            r = httpx.post(f"{base}/chat/completions", headers={"Authorization": f"Bearer {key}"},
-                           json={"model": model, "max_tokens": 5, "temperature": 0,
-                                 "messages": [{"role": "user", "content": "Reply with the word OK."}]},
-                           timeout=60)
-            r.raise_for_status()
-            print(f"[OK]   {provider:6} {model:28} ({in_list})")
+            text = llm._call(model, build_messages("How is glaucoma treated?", [HIT]))
+            ms = (time.perf_counter() - t0) * 1000
+            problems = [p for p, bad in [
+                ("empty (reasoning used all tokens?)", not text.strip()),
+                ("citations invalid", not citations_valid(text, 1)),
+                (f"unsafe: {guardrails.unsafe_output(text)}", bool(guardrails.unsafe_output(text))),
+                ("ungrounded", bool(guardrails.ungrounded(text, [PASSAGE], s.grounding_min_support))),
+            ] if bad]
+            report(f"{role}: {model}", not problems,
+                   f"{ms:.0f} ms, {len(text)} chars" + (f", {'; '.join(problems)}" if problems else "") +
+                   f" | {text.strip()[:90]!r}")
         except Exception as e:  # noqa: BLE001
-            ok = False
-            print(f"[FAIL] {provider:6} {model:28} ({in_list}) {describe(e)}")
-    for provider, ids in sorted(listed.items()):
-        usable = sorted(ids) if provider == "groq" else sorted(i for i in ids if "flash" in i or "pro" in i)
-        print(f"{provider} models available to this key: {', '.join(usable[:25])}")
-    sys.exit(0 if ok else 1)
+            report(f"{role}: {model}", False, describe(e))
+
+    # 3. judges, real prompt, must return parseable JSON with all metrics
+    for spec in pick_judges("qwen/qwen3.8-27b,gemini:gemini-3.8-flash"):
+        prompt = JUDGE_PROMPT.format(question="How is glaucoma treated?", passages=f"[1] Glaucoma: {PASSAGE}",
+                                     reference=PASSAGE, answer="Glaucoma is treated with eye drops, laser or surgery. [1]")
+        t0 = time.perf_counter()
+        try:
+            text, _ = judge_client(spec, replace(s, llm_retries=0)).complete([{"role": "user", "content": prompt}])
+            m = score(json.loads(text))
+            ok = m["faithfulness"] is not None and m["context_recall"] is not None
+            report(f"judge: {spec}", ok, f"{(time.perf_counter() - t0) * 1000:.0f} ms, faithfulness={m['faithfulness']}")
+        except Exception as e:  # noqa: BLE001
+            report(f"judge: {spec}", False, describe(e))
+
+    for name, ids in sorted(listed.items()):
+        usable = sorted(ids) if name == "groq" else sorted(i for i in ids if "flash" in i or "pro" in i)
+        print(f"{name} models available to this key: {', '.join(usable[:30])}")
+    sys.exit(0 if all(results) else 1)
 
 
 if __name__ == "__main__":

@@ -36,8 +36,8 @@ def test_gemini_judge_uses_its_own_endpoint_and_key(monkeypatch):
     from evals.judge_eval import GEMINI_URL, judge_client, pick_judges
     monkeypatch.setenv("GEMINI_API_KEY", "g-test")
     s = Settings(groq_api_key="q-test")
-    g, q = judge_client("gemini:gemini-2.5-flash", s), judge_client("openai/gpt-oss-120b", s)
-    assert (g.s.groq_url, g.s.groq_api_key, g.s.primary_model) == (GEMINI_URL, "g-test", "gemini-2.5-flash")
+    g, q = judge_client("gemini:gemini-3.8-flash", s), judge_client("openai/gpt-oss-120b", s)
+    assert (g.s.groq_url, g.s.groq_api_key, g.s.primary_model) == (GEMINI_URL, "g-test", "gemini-3.8-flash")
     assert (q.s.groq_api_key, q.s.primary_model) == ("q-test", "openai/gpt-oss-120b")
     monkeypatch.delenv("GEMINI_API_KEY")
-    assert pick_judges("openai/gpt-oss-120b,gemini:gemini-2.5-flash") == ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"]
+    assert pick_judges("openai/gpt-oss-120b,gemini:gemini-3.8-flash") == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]

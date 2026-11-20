@@ -43,11 +43,15 @@ class Settings:
     llm_provider: str = _env("LLM_PROVIDER", "groq")   # "groq" or "stub"
     groq_api_key: str = _env("GROQ_API_KEY", "")
     groq_url: str = _env("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
-    primary_model: str = _env("LLM_PRIMARY_MODEL", "llama-3.3-70b-versatile")
-    fallback_model: str = _env("LLM_FALLBACK_MODEL", "llama-3.1-8b-instant")
+    # Groq retired its Llama chat models (404 in scripts/llm_smoke.py, Nov 2026).
+    primary_model: str = _env("LLM_PRIMARY_MODEL", "openai/gpt-oss-120b")
+    fallback_model: str = _env("LLM_FALLBACK_MODEL", "openai/gpt-oss-20b")
     llm_timeout_s: float = float(_env("LLM_TIMEOUT_S", "10"))
     llm_retries: int = int(_env("LLM_RETRIES", "1"))
-    llm_max_tokens: int = int(_env("LLM_MAX_TOKENS", "300"))  # ~150-word answers; fewer tokens = faster
+    # gpt-oss is a reasoning model: hidden reasoning tokens count against this limit,
+    # so it is larger than a ~150-word answer needs. Low effort keeps reasoning short.
+    llm_max_tokens: int = int(_env("LLM_MAX_TOKENS", "1024"))
+    llm_reasoning_effort: str = _env("LLM_REASONING_EFFORT", "low")  # gpt-oss only; "" to omit
 
     # Redis cache + rate limit
     redis_url: str = _env("REDIS_URL", "")             # empty -> in-process fallback

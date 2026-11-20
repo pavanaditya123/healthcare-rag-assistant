@@ -47,12 +47,20 @@ class GroqLLM:
         self.http = http or httpx.Client(timeout=s.llm_timeout_s)
         self.backoff_s = backoff_s
 
+    def payload(self, model: str, messages: list[dict], stream: bool = False) -> dict:
+        body = {"model": model, "messages": messages, "temperature": 0,
+                "max_tokens": self.s.llm_max_tokens, **self.extra_body}
+        if "gpt-oss" in model and self.s.llm_reasoning_effort:
+            body["reasoning_effort"] = self.s.llm_reasoning_effort  # short hidden reasoning = faster
+        if stream:
+            body["stream"] = True
+        return body
+
     def _call(self, model: str, messages: list[dict]) -> str:
         resp = self.http.post(
             self.s.groq_url,
             headers={"Authorization": f"Bearer {self.s.groq_api_key}"},
-            json={"model": model, "messages": messages, "temperature": 0, "max_tokens": self.s.llm_max_tokens,
-                  **self.extra_body},
+            json=self.payload(model, messages),
             timeout=self.s.llm_timeout_s,
         )
         resp.raise_for_status()
@@ -92,8 +100,7 @@ class GroqLLM:
                 with self.http.stream(
                     "POST", self.s.groq_url,
                     headers={"Authorization": f"Bearer {self.s.groq_api_key}"},
-                    json={"model": model, "messages": messages, "temperature": 0,
-                          "max_tokens": self.s.llm_max_tokens, "stream": True},
+                    json=self.payload(model, messages, stream=True),
                     timeout=self.s.llm_timeout_s,
                 ) as resp:
                     resp.raise_for_status()

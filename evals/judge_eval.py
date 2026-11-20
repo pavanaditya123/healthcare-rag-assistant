@@ -82,9 +82,9 @@ def judge_client(spec: str, s: Settings) -> GroqLLM:
 def pick_judges(spec: str) -> list[str]:
     judges = spec.split(",")
     if not os.getenv("GEMINI_API_KEY") and any(j.startswith("gemini:") for j in judges):
-        print("GEMINI_API_KEY not set: using llama-3.3-70b-versatile as the second judge "
+        print("GEMINI_API_KEY not set: using openai/gpt-oss-20b as the second judge "
               "(same family as the generator, so expect it to be more lenient)")
-        judges = [("llama-3.3-70b-versatile" if j.startswith("gemini:") else j) for j in judges]
+        judges = [("openai/gpt-oss-20b" if j.startswith("gemini:") else j) for j in judges]
     return judges
 
 
@@ -227,7 +227,7 @@ def main():
     ap.add_argument("--index-path", default="data/eval_index")
     ap.add_argument("--medquad", type=int, default=30)
     ap.add_argument("--liveqa", type=int, default=20)
-    ap.add_argument("--judges", default="openai/gpt-oss-120b,gemini:gemini-2.5-flash",
+    ap.add_argument("--judges", default="qwen/qwen3.8-27b,gemini:gemini-3.8-flash",
                     help="two judges, comma separated; 'gemini:<model>' uses GEMINI_API_KEY. "
                          "Pick families different from the Llama generator.")
     ap.add_argument("--workers", type=int, default=4, help="parallel LLM calls")
