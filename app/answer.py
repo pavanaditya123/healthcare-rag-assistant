@@ -84,8 +84,7 @@ class Assistant:
     def retrieve(self, question, sources, qtypes) -> list[Hit]:
         """Top-k reranked hits, from the context cache when possible.
         Cached BEFORE the score threshold, so tuning MIN_RERANK_SCORE needs no flush."""
-        version = getattr(self.retriever, "index_version", lambda: "")()
-        key = f"{version}|{question}|{sorted(sources or [])}|{sorted(qtypes or [])}"
+        key = f"{question}|{sorted(sources or [])}|{sorted(qtypes or [])}"
         if self.context_cache:
             cached = self.context_cache.get(key)
             if cached is not None:

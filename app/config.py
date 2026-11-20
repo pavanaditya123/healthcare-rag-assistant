@@ -51,7 +51,7 @@ class Settings:
     cache_ttl_s: int = int(_env("CACHE_TTL_S", "3600"))            # final answers
     # Retrieved + reranked passages. Retrieval is ~98% of search time, so caching it
     # separately means an expired answer or an LLM retry costs only the LLM call.
-    # Safe to keep longer: the key includes the index version, so a re-index misses.
+    # Kept longer than answers: passages only change on re-index, and ingest clears them.
     context_cache_ttl_s: int = int(_env("CONTEXT_CACHE_TTL_S", "86400"))
     rate_limit_per_min: int = int(_env("RATE_LIMIT_PER_MIN", "30"))
 
