@@ -78,7 +78,7 @@ flowchart TD
     HR --> CE["Cross-encoder rerank<br/>ms-marco-MiniLM-L-6-v2, ONNX on CPU"]
     CE --> TH{"Top score >= MIN_RERANK_SCORE?"}
     TH -- "no" --> NI["no_info response"]
-    TH -- "yes" --> LLM["LLM generation<br/>Groq Llama 3.3 70B, top-5 passages"]
+    TH -- "yes" --> LLM["LLM generation<br/>Groq gpt-oss-120b, top-5 passages"]
     LLM --> OG{"Output guardrails<br/>1 citations valid<br/>2 no dose / diagnosis<br/>3 sentences grounded"}
     OG -- "pass" --> OK["answered + sources<br/>+ disclaimer"]
     OG -- "fail / LLMError" --> DG["degraded: sources-only answer<br/>+ disclaimer, blocked_by"]
@@ -205,7 +205,7 @@ can't trigger an emergency, because the person cue is still required.
 flowchart LR
     T["LLM text"] --> C1{"1 citations_valid()<br/>every [n] exists,<br/>every paragraph cited"}
     C1 -- ok --> C2{"2 unsafe_output()<br/>doses: 400 mg, every 4 hours<br/>advice: you should stop taking<br/>diagnosis: you probably have"}
-    C2 -- ok --> C3{"3 ungrounded()<br/>share of each sentence's content<br/>words found in its cited passages<br/>>= GROUNDING_MIN_SUPPORT"}
+    C2 -- ok --> C3{"3 ungrounded()<br/>share of each sentence's content<br/>words found in its cited passages<br/>shadow mode until calibrated"}
     C3 -- ok --> D["4 add_disclaimer()<br/>fixed footer, in code"]
     D --> OK["answered"]
     C1 -- fail --> DG["degraded<br/>NIH passages verbatim<br/>blocked_by = reason"]
@@ -233,9 +233,19 @@ Every blocked answer says why in `blocked_by` (`invalid_citations`,
 The grounding check is a cheap lexical test: words are matched on their first 5
 letters, so *treat / treated / treatment* count as the same word, and it runs on every
 request in about 1 ms. It can't recognise a correct paraphrase that uses entirely new
-words, which is why the LLM-as-judge eval measures faithfulness properly offline. Its
-threshold (`GROUNDING_MIN_SUPPORT`, default 0.5) is to be calibrated against the judge's
-faithfulness labels.
+words. On real gpt-oss answers that looked correct, it scored 0.0 and 0.29 in the smoke
+test, so at the first-guess threshold of 0.5 it would have blocked good answers.
+
+It therefore runs in **shadow mode**: every answer reports `grounding_support`, and
+answers below `GROUNDING_MIN_SUPPORT` are counted in `rag_grounding_flagged_total{action="shadow"}`
+but not blocked. The LLM-as-judge eval prints a calibration table (for each threshold:
+faithful answers it would block versus confirmed hallucinations it would catch). Blocking is
+switched on with `GROUNDING_ENFORCE=true` once a threshold with near-zero false blocks is found.
+This is standard practice for a new guardrail: measure first, then enforce.
+
+**In everyday terms:** a new airport scanner first runs *alongside* the old process
+for a few weeks. It flags bags, but nobody is stopped until its alarms have been
+checked against what was really in the bags.
 
 **Why rules instead of an ML classifier?** For emergencies, a readable,
 unit-tested regex beats a model you have to trust, and it adds ~0 ms. "What are the
@@ -303,7 +313,7 @@ first part of those.
 ```mermaid
 flowchart LR
     P["top-5 passages<br/>max 1,500 chars each"] --> PR["Prompt<br/>answer ONLY from sources,<br/>cite every paragraph,<br/>no diagnosis, no dosing,<br/>max 150 words"]
-    PR --> G["Groq Llama 3.3 70B<br/>temperature 0, max 300 tokens"]
+    PR --> G["Groq openai/gpt-oss-120b<br/>temperature 0, low reasoning effort,<br/>max 1,024 tokens incl. hidden reasoning"]
     G --> V{"citations_valid()"}
     V -- "all [n] in 1..5 and<br/>every paragraph cited" --> A["answered"]
     V -- "invented [7] or<br/>uncited paragraph" --> D["degraded:<br/>sources-only answer"]
@@ -487,8 +497,8 @@ before it ships.
 flowchart LR
     QS["50 questions<br/>30 MedQuAD + 20 LiveQA<br/>with NIH reference answers"] --> R["retrieve<br/>sequential, CPU"]
     R --> G["generate<br/>ThreadPoolExecutor"]
-    G --> J1["Judge A<br/>openai/gpt-oss-120b (Groq)"]
-    G --> J2["Judge B<br/>Gemini 2.5 Flash"]
+    G --> J1["Judge A<br/>qwen/qwen3.8-27b (Groq)"]
+    G --> J2["Judge B<br/>gemini-3.8-flash (Google)"]
     J1 --> M["per-answer JSON:<br/>claims + support, relevance,<br/>passage relevance, reference facts"]
     J2 --> M
     M --> CF{"error flagged by"}
@@ -504,7 +514,7 @@ flowchart LR
 | context_precision | Average precision of relevant passages in rank order | noisy context → retrieval / threshold |
 | context_recall | Share of reference-answer facts present in the passages | retrieval miss → retrieval / chunking |
 
-- **Two judges from different families**, neither of them Llama (the generator's family), to reduce self-preference bias. Agreement per error type is reported.
+- **Two judges from different families** (Qwen and Gemini), neither from the generator's family (gpt-oss), to reduce self-preference bias. Agreement per error type is reported.
 - **One JSON judgment per answer** instead of the `ragas` package's 4–8 calls, to fit free-tier limits; same metric definitions, prompts in the file.
 - **~0.5M tokens per run**, so it runs on manual dispatch only.
 - Gemini's free tier may use submitted data to improve Google's products. That's acceptable for public NIH text, not for real user questions.
@@ -539,7 +549,7 @@ context cache skipped retrieval.
 | Parallel BM25 + dense | Latency = max(sparse, dense), not the sum |
 | `CANDIDATES=10`, `RERANK_MAX_CHARS=1000` | Fewer, shorter cross-encoder pairs (see speed table) |
 | SSE streaming (`/ask/stream`) | Sources emitted after retrieval; tokens as generated; time-to-first-token is a metric |
-| `LLM_MAX_TOKENS=300` | Output length bounds generation time |
+| `LLM_REASONING_EFFORT=low`, prompt caps answers at 150 words | gpt-oss spends fewer hidden reasoning tokens, and output length bounds generation time (smoke test: 0.5 s for gpt-oss-120b) |
 | Warm-up query at startup | First ONNX inference cost paid before readiness |
 | Models baked into the image | No model download on pod start |
 | Degraded answers not cached | The next request retries the LLM |
@@ -620,8 +630,8 @@ get their food on time. Meanwhile the manager (autoscaler) opens another dining 
 
 ```mermaid
 flowchart LR
-    P["primary: llama-3.3-70b-versatile<br/>timeout 10 s"] -- "408 / 429 / 5xx / timeout" --> R["retry with backoff"]
-    R -- "still failing" --> F["fallback: llama-3.1-8b-instant"]
+    P["primary: openai/gpt-oss-120b<br/>timeout 10 s"] -- "408 / 429 / 5xx / timeout" --> R["retry with backoff"]
+    R -- "still failing" --> F["fallback: openai/gpt-oss-20b"]
     P -- "400 / non-retryable" --> F
     F -- "fails" --> S["LLMError -> degraded<br/>sources-only answer"]
 ```
@@ -762,6 +772,7 @@ shed (with `Retry-After: 1`), `404` / `409` unknown or repeated feedback.
 | ~1.5 req/s per pod; CPU cross-encoder is the bottleneck | 100 req/s ≈ 70 pods. A GPU or hosted reranker is the real fix |
 | LiveQA recall@5 ≈ 0.45–0.52 | Weakest metric. Next: a UMLS synonym graph from MedQuAD's annotations, and small-to-big chunking for long sections |
 | Not deployed to a real cluster | Load numbers are single-machine |
+| Hosted models get retired (Groq removed its Llama models; Gemini 2.5 Flash closed to new users) | Every call then falls back silently to sources-only. Mitigated by logging each failure with its HTTP status, and the manual `LLM smoke test` workflow, which checks every model through the production path. An alert on `rag_degraded_total{reason="llm_unavailable"}` would catch it in production |
 | HPA on CPU | In-flight searches / shed rate is the truer saturation signal |
 | Single Qdrant and Redis, no backups, re-index not zero-downtime | Single points of failure; Qdrant collection aliases would fix the re-index |
 | No auth or TLS; rate limit per IP | Needs API keys or OAuth at a gateway |
@@ -796,8 +807,8 @@ tests/           unit tests with fake encoders
 | Group | Environment variables |
 |---|---|
 | Storage | `QDRANT_URL`, `REDIS_URL` |
-| LLM | `GROQ_API_KEY`, `LLM_PROVIDER` (`groq` / `stub`), `LLM_PRIMARY_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_TIMEOUT_S`, `LLM_RETRIES`, `LLM_MAX_TOKENS` |
-| Retrieval and guardrails | `CANDIDATES`, `TOP_K`, `RERANK_MAX_CHARS`, `MIN_RERANK_SCORE`, `GROUNDING_MIN_SUPPORT` |
+| LLM | `GROQ_API_KEY`, `LLM_PROVIDER` (`groq` / `stub`), `LLM_PRIMARY_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_TIMEOUT_S`, `LLM_RETRIES`, `LLM_MAX_TOKENS`, `LLM_REASONING_EFFORT` |
+| Retrieval and guardrails | `CANDIDATES`, `TOP_K`, `RERANK_MAX_CHARS`, `MIN_RERANK_SCORE`, `GROUNDING_MIN_SUPPORT`, `GROUNDING_ENFORCE` |
 | Caching and limits | `CACHE_TTL_S`, `CONTEXT_CACHE_TTL_S`, `RATE_LIMIT_PER_MIN` |
 | CPU protection | `MAX_INFLIGHT`, `QUEUE_TIMEOUT_S`, `ONNX_THREADS` |
 
