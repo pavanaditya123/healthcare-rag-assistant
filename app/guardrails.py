@@ -90,6 +90,19 @@ def ungrounded(text: str, passages: list[str], threshold: float) -> list[str]:
     return [sent for sent, v in sentence_supports(text, passages) if v < threshold]
 
 
+# ---------------------------------------------------------------- 0. normalise
+# gpt-oss writes citations in its native format, 【1】 or 【1†L1-L9】, and uses
+# Unicode punctuation (non-breaking hyphens, narrow spaces). In the judge eval
+# this made 20 of 37 properly cited answers fail validation. Normalise first.
+_NATIVE_CITATION = re.compile(r"【(\d+)(?:†[^】]*)?】")
+_UNICODE_PUNCT = str.maketrans({"‐": "-", "‑": "-", "‒": "-", " ": " ", " ": " ", " ": " "})
+
+
+def normalize(text: str) -> str:
+    """【1†L1-L9】 -> [1], Unicode hyphens/spaces -> ASCII. Run before every output check."""
+    return _NATIVE_CITATION.sub(r"[\1]", text).translate(_UNICODE_PUNCT)
+
+
 # ---------------------------------------------------------------- 4. disclaimer
 DISCLAIMER_TEXT = ("This is general health information from NIH sources, not medical advice. "
                    "Please talk to a doctor or other healthcare professional about your own situation.")
