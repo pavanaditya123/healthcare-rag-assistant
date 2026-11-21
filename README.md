@@ -243,6 +243,19 @@ faithful answers it would block versus confirmed hallucinations it would catch).
 switched on with `GROUNDING_ENFORCE=true` once a threshold with near-zero false blocks is found.
 This is standard practice for a new guardrail: measure first, then enforce.
 
+**Calibration result (judge eval, 14 answers both judges rated fully faithful):**
+
+| `GROUNDING_MIN_SUPPORT` | Faithful answers it would block | Confirmed hallucinations it would catch |
+|---|---|---|
+| 0.2 | 1 / 14 | 0 / 0 |
+| 0.3 | 3 / 14 | 0 / 0 |
+| 0.5 | 6 / 14 | 0 / 0 |
+
+At every threshold it blocks good answers, and there were no confirmed hallucinations
+for it to catch. So it **stays in shadow mode**: a lexical check can't tell a correct
+paraphrase from a made-up claim. Enforcing grounding properly would need a semantic
+check (an NLI model, or an LLM judge on the live path) and a larger labelled set.
+
 **In everyday terms:** a new airport scanner first runs *alongside* the old process
 for a few weeks. It flags bags, but nobody is stopped until its alarms have been
 checked against what was really in the bags.
@@ -518,7 +531,38 @@ flowchart LR
 - **One JSON judgment per answer** instead of the `ragas` package's 4–8 calls, to fit free-tier limits; same metric definitions, prompts in the file.
 - **~0.5M tokens per run**, so it runs on manual dispatch only.
 - Gemini's free tier may use submitted data to improve Google's products. That's acceptable for public NIH text, not for real user questions.
-- **Status:** the first run is in progress; results will be added here.
+
+**Results** (50 questions: 30 MedQuAD + 20 real LiveQA; generator `openai/gpt-oss-120b`):
+
+| Metric | Judge A: `qwen/qwen3.8-27b` | Judge B: `gemini-3.5-flash-lite` |
+|---|---|---|
+| faithfulness | 0.938 | 0.984 |
+| citation_accuracy | 0.906 | 0.984 |
+| answer_relevancy | 0.938 | 1.000 |
+| context_precision | 0.949 | 0.935 |
+| context_recall | 0.989 | 1.000 |
+
+| Error type | Confirmed (both judges) | Disputed (one judge) | Judge agreement |
+|---|---|---|---|
+| hallucination | 0 / 15 | 1 / 15 | 93% |
+| miscitation | 1 / 15 | 0 / 15 | 100% |
+| retrieval miss, noisy context, off-target | 0 / 15 | 0 / 15 | 100% |
+
+**The biggest error the eval found was in my guardrail, not the model.** Only 17 of 37
+generated answers reached users. All 20 blocked answers failed `citations_valid()`,
+because gpt-oss cites in its native format (`【1】`, `【1†L1-L9】`) and uses Unicode
+punctuation ("health‑care" with a non-breaking hyphen), while the validator only
+accepted `[1]`. Fix: `guardrails.normalize()` runs before every output check, and the
+prompt now asks for `[1]` explicitly. Replaying the same 37 real answers through
+`finish()`: **17 → 33 shown to users (46% → 89%)**, with no new unsafe-content flags.
+The 4 still blocked each contain a genuinely uncited paragraph.
+
+The other 13 of 50 questions got `no_info` (retrieval score below the threshold),
+mostly the long, messy LiveQA questions, which is the same weakness the retrieval eval shows.
+
+Caveats: the judges graded only the 17 answers that passed the old validator (15–16
+with both verdicts), which is a small sample. The next run grades the answers unblocked
+by the citation fix as well.
 
 **In everyday terms:** an exam paper is marked by **two independent examiners**.
 If both say an answer is wrong, it's wrong, and that's what gets fixed first. If

@@ -17,14 +17,15 @@ from app.retrieval import Hit
 
 SYSTEM_PROMPT = (
     "You are a health information assistant. Answer ONLY from the numbered NIH sources "
-    "provided. End every paragraph with the numbers of the sources it uses, like [1] or [2][3]. "
+    "provided. End every paragraph with the numbers of the sources it uses, written exactly like "
+    "[1] or [2][3] (square brackets, no other citation format). "
     "If the sources do not answer the question, say so. Never diagnose, never recommend "
     "doses, and suggest seeing a healthcare professional for personal medical decisions. "
     "Use plain language and at most 150 words."
 )
 MAX_SOURCE_CHARS = 1500  # keep the prompt small; MedQuAD answers can be very long
 CITATION = re.compile(r"\[(\d+)\]")
-DISCLAIMER = re.compile(r"doctor|healthcare (?:professional|provider)|pharmacist|clinician", re.IGNORECASE)
+DISCLAIMER = re.compile(r"doctor|health[- ]?care (?:professional|provider)|pharmacist|clinician", re.IGNORECASE)
 
 
 @dataclass
@@ -123,6 +124,7 @@ class Assistant:
     def finish(self, text: str, hits: list[Hit], srcs: list[dict], model, ctx: bool) -> Answer:
         """Output guardrails, shared by /ask and /ask/stream. Any failure means
         the user gets the NIH passages verbatim instead of generated text."""
+        text = guardrails.normalize(text)
         passages = [h.payload["text"][:MAX_SOURCE_CHARS] for h in hits]
         support = guardrails.min_support(text, passages)
         weak = support is not None and support < self.s.grounding_min_support
