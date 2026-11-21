@@ -532,37 +532,44 @@ flowchart LR
 - **~0.5M tokens per run**, so it runs on manual dispatch only.
 - Gemini's free tier may use submitted data to improve Google's products. That's acceptable for public NIH text, not for real user questions.
 
-**Results** (50 questions: 30 MedQuAD + 20 real LiveQA; generator `openai/gpt-oss-120b`):
+**Results** (50 questions: 30 MedQuAD + 20 real LiveQA; generator `openai/gpt-oss-120b`),
+before and after the citation-format fix described below:
 
-| Metric | Judge A: `qwen/qwen3.8-27b` | Judge B: `gemini-3.5-flash-lite` |
+| | Run 1 (before fix) | Run 2 (after fix) |
 |---|---|---|
-| faithfulness | 0.938 | 0.984 |
-| citation_accuracy | 0.906 | 0.984 |
-| answer_relevancy | 0.938 | 1.000 |
-| context_precision | 0.949 | 0.935 |
-| context_recall | 0.989 | 1.000 |
+| Generated answers shown to users | 17 / 37 (46%) | **36 / 37 (97%)** |
+| Answers graded by both judges | 15 | 34 |
+| Faithfulness (Qwen / Gemini) | 0.938 / 0.984 | 0.936 / 0.965 |
+| Citation accuracy | 0.906 / 0.984 | 0.932 / 0.961 |
+| Answer relevancy | 0.938 / 1.000 | 0.958 / 0.985 |
+| Context precision | 0.949 / 0.935 | 0.935 / 0.911 |
+| Context recall | 0.989 / 1.000 | 0.905 / 0.970 |
+| Confirmed hallucinations | 0 / 15 | **2 / 34** |
+| Confirmed miscitations | 1 / 15 | 1 / 34 |
+| Judge agreement (per error type) | 93–100% | 85–100% |
 
-| Error type | Confirmed (both judges) | Disputed (one judge) | Judge agreement |
-|---|---|---|---|
-| hallucination | 0 / 15 | 1 / 15 | 93% |
-| miscitation | 1 / 15 | 0 / 15 | 100% |
-| retrieval miss, noisy context, off-target | 0 / 15 | 0 / 15 | 100% |
-
-**The biggest error the eval found was in my guardrail, not the model.** Only 17 of 37
-generated answers reached users. All 20 blocked answers failed `citations_valid()`,
+**Finding 1: the biggest error was in my guardrail, not the model.** In run 1, only 17
+of 37 generated answers reached users. All 20 blocked answers failed `citations_valid()`,
 because gpt-oss cites in its native format (`【1】`, `【1†L1-L9】`) and uses Unicode
 punctuation ("health‑care" with a non-breaking hyphen), while the validator only
 accepted `[1]`. Fix: `guardrails.normalize()` runs before every output check, and the
-prompt now asks for `[1]` explicitly. Replaying the same 37 real answers through
-`finish()`: **17 → 33 shown to users (46% → 89%)**, with no new unsafe-content flags.
-The 4 still blocked each contain a genuinely uncited paragraph.
+prompt asks for `[1]` explicitly. Run 2 confirms it on fresh answers: **36 of 37 shown**,
+with faithfulness unchanged on more than twice as many graded answers.
 
-The other 13 of 50 questions got `no_info` (retrieval score below the threshold),
-mostly the long, messy LiveQA questions, which is the same weakness the retrieval eval shows.
+**Finding 2: with more answers graded, two confirmed hallucinations appeared.** Both
+add facts that are nowhere in the passages: "a shallow hip socket (acetabular dysplasia)"
+for congenital coxa vara, and "the condition does not progress" for trisomy 13. When the
+NIH passages were thin, gpt-oss filled the gap from its own memory. Next fix: the prompt
+now forbids outside knowledge explicitly and asks the model to say when the sources
+cover only part of the question; the next judge run measures whether it worked.
 
-Caveats: the judges graded only the 17 answers that passed the old validator (15–16
-with both verdicts), which is a small sample. The next run grades the answers unblocked
-by the citation fix as well.
+**Finding 3: the lexical grounding check still can't be enforced.** Both hallucinations
+scored 0.0 grounding support, but so did 3 of 29 answers both judges rated fully
+faithful: blocking at any threshold would hide about 10% of good answers to catch them.
+It stays in shadow mode, where those scores remain useful as a monitoring signal.
+
+13 of 50 questions got `no_info` in both runs (retrieval score below the threshold),
+mostly long, messy LiveQA questions: the same weakness the retrieval eval shows.
 
 **In everyday terms:** an exam paper is marked by **two independent examiners**.
 If both say an answer is wrong, it's wrong, and that's what gets fixed first. If
